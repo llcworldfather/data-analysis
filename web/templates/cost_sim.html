@@ -97,6 +97,11 @@
         <div id="sensitivity-body" class="text-xs text-slate-600 space-y-3 leading-relaxed">
           <p class="text-slate-400">修改组件单价并点击「计算预测产品价」后显示</p>
         </div>
+        <div id="sensitivity-grid-wrap" class="mt-4 hidden">
+          <div class="text-xs font-medium text-slate-700 mb-2">双因素交叉敏感性（改价 Top2 组件 ±10%）</div>
+          <p id="sensitivity-grid-caption" class="text-[10px] text-slate-500 mb-2"></p>
+          <div id="sensitivity-grid-table" class="overflow-x-auto"></div>
+        </div>
       </div>
       <!-- 模型历史误差（始终显示，与调价无关） -->
       <div class="rounded-xl border-2 border-emerald-200 bg-emerald-50/40 p-5 shadow-sm">
@@ -372,6 +377,57 @@
               );
             })
             .join("");
+        }
+      }
+
+      const gridWrap = document.getElementById("sensitivity-grid-wrap");
+      const gridTbl = document.getElementById("sensitivity-grid-table");
+      const gridCap = document.getElementById("sensitivity-grid-caption");
+      const grid = j.敏感性网格 || {};
+      if (gridWrap && gridTbl) {
+        if (grid.可用 && grid.矩阵 && grid.组件 && grid.组件.length >= 2) {
+          gridWrap.classList.remove("hidden");
+          const cA = grid.组件[0];
+          const cB = grid.组件[1];
+          const base = Number(grid.基准产品价格_kg) || 0;
+          const steps = grid.扰动步长_pct || [-10, 0, 10];
+          if (gridCap) {
+            gridCap.textContent =
+              "行：" + esc(cA.名称 || cA.编码) + " 单价扰动%；列：" + esc(cB.名称 || cB.编码) + " 单价扰动%；单元格为产品价(元/kg)";
+          }
+          function cellColor(v) {
+            if (!base || v == null || isNaN(v)) return "bg-slate-50";
+            const d = (v - base) / base;
+            if (d > 0.02) return "bg-red-100";
+            if (d < -0.02) return "bg-emerald-100";
+            return "bg-amber-50";
+          }
+          let html =
+            '<table class="text-[10px] border-collapse w-full max-w-md"><thead><tr><th class="border border-amber-200 p-1 bg-white"></th>';
+          steps.forEach((s) => {
+            html += '<th class="border border-amber-200 p-1 bg-white num">' + esc(String(s)) + "%</th>";
+          });
+          html += "</tr></thead><tbody>";
+          (grid.矩阵 || []).forEach((row, ri) => {
+            html +=
+              '<tr><th class="border border-amber-200 p-1 bg-white text-left">' +
+              esc(String(steps[ri])) +
+              "%</th>";
+            row.forEach((v) => {
+              html +=
+                '<td class="border border-amber-200 p-1 text-center num ' +
+                cellColor(v) +
+                '">' +
+                (v != null ? fmt(v) : "—") +
+                "</td>";
+            });
+            html += "</tr>";
+          });
+          html += "</tbody></table>";
+          gridTbl.innerHTML = html;
+        } else {
+          gridWrap.classList.add("hidden");
+          gridTbl.innerHTML = "";
         }
       }
 

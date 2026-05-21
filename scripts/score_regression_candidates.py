@@ -198,9 +198,7 @@ def main() -> None:
                 }
             )
 
-    expanded = expand_product_cost_history_dict(
-        dict(pch), dict(pbom), None, ppt
-    )
+    expanded = expand_product_cost_history_dict(dict(pch), dict(pbom), ppt)
 
     all_pids = sorted(bom_codes | price_codes)
     rows = []

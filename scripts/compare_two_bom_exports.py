@@ -58,7 +58,7 @@ def score_bom(bom_path: Path, pid: str, price: pd.DataFrame, ppt) -> dict:
                 "组件单价": float(row["组件单价"] or 0),
             }
         )
-    exp = expand_product_cost_history_dict(dict(pch), dict(pbom), None, ppt)
+    exp = expand_product_cost_history_dict(dict(pch), dict(pbom), ppt)
     hist = exp.get(pid, pch.get(pid, []))
     pairs = []
     for h in hist:

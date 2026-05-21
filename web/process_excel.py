@@ -88,6 +88,21 @@ def norm_material_code(series: pd.Series) -> pd.Series:
     return series.map(norm_material_code_scalar)
 
 
+def norm_material_code_expr(col: str) -> pl.Expr:
+    """Polars 向量化物料编码规范化（替代 map_elements）。"""
+    c = (
+        pl.col(col)
+        .cast(pl.String)
+        .str.strip_chars()
+        .str.replace(r"\.0+$", "")
+    )
+    return (
+        pl.when(c.is_null() | c.is_in(["nan", "None", "<NA>", ""]))
+        .then(pl.lit(""))
+        .otherwise(c)
+    )
+
+
 # ---------------------------------------------------------------------------
 # I/O
 # ---------------------------------------------------------------------------
@@ -124,12 +139,17 @@ def _print_no_excel_error() -> None:
     )
 
 
-def _read_one_excel(path: Path) -> pl.DataFrame:
+def _read_one_excel_lazy(path: Path) -> pl.LazyFrame:
     print(f"  读取：{path.name}")
-    return (
-        pl.from_pandas(pd.read_excel(path, sheet_name=0))
-        .with_columns(pl.lit(path.name).alias("_源文件"))
-    )
+    try:
+        lf = pl.scan_excel(path)
+    except Exception:
+        lf = pl.from_pandas(pd.read_excel(path, sheet_name=0)).lazy()
+    return lf.with_columns(pl.lit(path.name).alias("_源文件"))
+
+
+def _read_one_excel(path: Path) -> pl.DataFrame:
+    return _read_one_excel_lazy(path).collect()
 
 
 def _validate_required_columns(raw: pl.DataFrame) -> None:
@@ -139,15 +159,17 @@ def _validate_required_columns(raw: pl.DataFrame) -> None:
         sys.exit(1)
 
 
-def load_all_excels() -> pl.DataFrame:
+def load_all_excels_lazy() -> pl.LazyFrame:
     paths = _excel_paths_in_data()
     if not paths:
         _print_no_excel_error()
         sys.exit(1)
-    frames: list[pl.DataFrame] = []
-    for p in paths:
-        frames.append(_read_one_excel(p))
-    raw = pl.concat(frames, how="diagonal")
+    lfs = [_read_one_excel_lazy(p) for p in paths]
+    return pl.concat(lfs, how="diagonal")
+
+
+def load_all_excels() -> pl.DataFrame:
+    raw = load_all_excels_lazy().collect()
     _validate_required_columns(raw)
     return raw
 
@@ -182,8 +204,8 @@ def prepare(raw: pl.DataFrame) -> pl.DataFrame:
     return (
         raw
         .with_columns([
-            pl.col(COL_PRODUCT).cast(pl.String).str.strip_chars(),
-            pl.col(COL_COMPONENT).cast(pl.String).str.strip_chars(),
+            norm_material_code_expr(COL_PRODUCT).alias(COL_PRODUCT),
+            norm_material_code_expr(COL_COMPONENT).alias(COL_COMPONENT),
             pl.col(COL_QTY).cast(pl.Float64, strict=False).fill_null(0.0),
             pl.col(COL_UNIT_PRICE).cast(pl.Float64, strict=False).fill_null(0.0),
         ])
@@ -470,7 +492,7 @@ def main() -> None:
         for i, (src, out_xlsx) in enumerate(pairs, start=1):
             tag = f"[{i}/{len(pairs)} {src.name}]"
             print(f"{tag} [1/6] 加载数据...")
-            raw = _read_one_excel(src)
+            raw = _read_one_excel_lazy(src).collect()
             _validate_required_columns(raw)
             run_pipeline(raw, out_xlsx, label=tag)
         print(f"\n完成！共生成 {len(pairs)} 个 Excel 报告（时间戳 {ts}）。")
@@ -479,7 +501,8 @@ def main() -> None:
 
     print("模式：合并 data/ 下全部 Excel 为一份报告\n")
     print("[1/6] 加载数据...")
-    raw = load_all_excels()
+    raw = load_all_excels_lazy().collect()
+    _validate_required_columns(raw)
     out_xlsx = OUTPUT_DIR / f"bom_analysis_{ts}.xlsx"
     run_pipeline(raw, out_xlsx)
     print(f"\n完成！")

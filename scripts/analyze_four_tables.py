@@ -111,7 +111,7 @@ def main():
                 "组件单价": float(row["组件单价"] or 0),
             }
         )
-    expanded = expand_product_cost_history_dict(dict(pch), dict(pbom), None, ppt)
+    expanded = expand_product_cost_history_dict(dict(pch), dict(pbom), ppt)
 
     price_periods = {}
     for pid, grp in price.groupby("产品编码"):

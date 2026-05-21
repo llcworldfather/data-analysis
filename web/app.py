@@ -107,6 +107,10 @@ from cost_sim_predict import (
     build_product_cost_history,
     build_product_price_timeline,
     expand_product_cost_history_dict,
+    map_legacy_predict_en_to_zh,
+    map_regression_analysis_en_to_zh,
+    map_sensitivity_grid_en_to_zh,
+    map_sensitivity_item_en_to_zh,
     normalize_predict_dataframes,
     normalize_price_list_cost_fields,
     predict_product_price,
@@ -748,7 +752,6 @@ def _fill_bi_cache(
     pch = expand_product_cost_history_dict(
         product_cost_history or {},
         product_bom,
-        None,
         product_price_timeline,
     )
 
@@ -1227,6 +1230,7 @@ def _map_new_predict_result(
             "可信度等级": "低",
             "可信度说明": pred["error"],
             "敏感性分析": [],
+            "敏感性网格": {"可用": False},
             "模型历史误差": {"可用": False, "说明": pred["error"]},
             "预测警告": [pred["error"]],
             "预测详情": None,
@@ -1305,7 +1309,13 @@ def _map_new_predict_result(
             if base_product is not None and base_total is not None
             else None
         ),
-        "敏感性分析": pred.get("sensitivity") or [],
+        "敏感性分析": [
+            map_sensitivity_item_en_to_zh(x) for x in (pred.get("sensitivity") or [])
+        ],
+        "敏感性网格": map_sensitivity_grid_en_to_zh(pred.get("sensitivity_grid") or {}),
+        "回归分析": map_regression_analysis_en_to_zh(pred.get("regression_analysis") or {})
+        if pred.get("regression_analysis")
+        else None,
         "模型历史误差": pred.get("model_error") or {"可用": False},
         "预测警告": warnings_list,
         "预测详情": pred.get("detail"),
@@ -1366,17 +1376,19 @@ def bi_product_bom(session_id: str):
         )
         pred = _map_new_predict_result(pred, price_snap, is_bom_load=True)
     else:
-        pred = _predict_product_price_legacy(
-            product=product,
-            simulated_material=baseline,
-            baseline_material=baseline,
-            price_snap=price_snap,
-            product_cost_history=cache.get("product_cost_history"),
-            price_history=cache.get("price_history"),
-            bom_rows=rows,
-            prices_new=prices_old,
-            prices_old=prices_old,
-            product_categories=cache.get("product_categories"),
+        pred = map_legacy_predict_en_to_zh(
+            _predict_product_price_legacy(
+                product=product,
+                simulated_material=baseline,
+                baseline_material=baseline,
+                price_snap=price_snap,
+                product_cost_history=cache.get("product_cost_history"),
+                price_history=cache.get("price_history"),
+                bom_rows=rows,
+                prices_new=prices_old,
+                prices_old=prices_old,
+                product_categories=cache.get("product_categories"),
+            )
         )
 
     lines_out = [_json_clean_row(row) for row in lines]
@@ -1459,17 +1471,19 @@ def _simulate_product_cost(
         )
         pred = _map_new_predict_result(pred, price_snap)
     else:
-        pred = _predict_product_price_legacy(
-            product=product,
-            simulated_material=simulated,
-            baseline_material=baseline,
-            price_snap=price_snap,
-            product_cost_history=cache.get("product_cost_history"),
-            price_history=cache.get("price_history"),
-            bom_rows=rows,
-            prices_new={c: prices.get(c, prices_old[c]) for c in prices_old},
-            prices_old=prices_old,
-            product_categories=cache.get("product_categories"),
+        pred = map_legacy_predict_en_to_zh(
+            _predict_product_price_legacy(
+                product=product,
+                simulated_material=simulated,
+                baseline_material=baseline,
+                price_snap=price_snap,
+                product_cost_history=cache.get("product_cost_history"),
+                price_history=cache.get("price_history"),
+                bom_rows=rows,
+                prices_new={c: prices.get(c, prices_old[c]) for c in prices_old},
+                prices_old=prices_old,
+                product_categories=cache.get("product_categories"),
+            )
         )
 
     ref_total = price_snap.get("总成本")

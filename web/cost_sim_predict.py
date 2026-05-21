@@ -25,6 +25,7 @@ from process_excel import (
     COL_QTY,
     COL_UNIT_PRICE,
     norm_material_code,
+    norm_material_code_expr,
     norm_material_code_scalar,
     normalize_columns,
 )
@@ -39,6 +40,12 @@ PASS_THROUGH_CATEGORY_MIN_SLOPES = 30
 PASS_THROUGH_CATEGORY_MIN_PRODUCTS = 3
 # Theil-Sen 时间衰减（月）：w = exp(-λ * months_ago)，λ≈0.2 → 半衰期约 3.5 月
 TIME_DECAY_LAMBDA = 0.2
+# 斜率池 MAD 离群过滤（样本数不足时跳过）
+SLOPE_MAD_K = 3.5
+SLOPE_MAD_MIN_SAMPLES = 4
+# 低价值物料：不参与超区间扣分 / σ 冲击
+LOW_VALUE_UNIT_PRICE_YUAN = 0.5
+MIN_BASE_AMOUNT_YUAN = 1.0
 
 _DATE_ALIASES = ("创建日期", "生价日期", "CREATEDATE", "生产日期", "日期")
 
@@ -59,10 +66,15 @@ def _timeline_month_key(dk: Any) -> str:
 
 
 def quote_month_key_from_series(s: pd.Series) -> pd.Series:
-    """将「报价月份」或日期列规范为 YYYYMM（如 202512）。"""
+    """将「报价月份」或日期列规范为 YYYYMM；优先 pd.to_datetime，再回退 calendar_date_key。"""
     raw = norm_material_code(s)
+    ts = pd.to_datetime(raw, errors="coerce", dayfirst=False)
+    out = pd.Series("", index=s.index, dtype=object)
+    valid = ts.notna()
+    if valid.any():
+        out.loc[valid] = ts.loc[valid].dt.strftime("%Y%m")
 
-    def _one(v: str) -> str:
+    def _fallback(v: str) -> str:
         if not v:
             return ""
         digits = re.sub(r"\D", "", v)
@@ -73,23 +85,18 @@ def quote_month_key_from_series(s: pd.Series) -> pd.Series:
         dk = calendar_date_key_yyyymmdd(v)
         return dk[:6] if dk and len(dk) >= 6 else ""
 
-    return raw.map(_one)
+    miss = ~valid
+    if miss.any():
+        out.loc[miss] = raw.loc[miss].map(_fallback)
+    return out.astype(str)
 
 
 def quote_month_key_scalar(v: Any) -> str:
     """单值报价月份 → YYYYMM（与 quote_month_key_from_series 一致）。"""
     if v is None:
         return ""
-    s = norm_material_code_scalar(v)
-    if not s:
-        return ""
-    digits = re.sub(r"\D", "", s)
-    if len(digits) >= 6:
-        return digits[:6]
-    if len(digits) == 4:
-        return digits
-    dk = calendar_date_key_yyyymmdd(s)
-    return dk[:6] if dk and len(dk) >= 6 else ""
+    ser = quote_month_key_from_series(pd.Series([v]))
+    return str(ser.iloc[0]) if len(ser) else ""
 
 
 def quote_month_key_from_value(v: Any) -> str:
@@ -146,10 +153,7 @@ def build_product_category_index(bom_df: pd.DataFrame | pl.DataFrame) -> dict[st
     )
     ranked = (
         df.with_columns(
-            pl.col(COL_PRODUCT)
-            .cast(pl.Utf8)
-            .map_elements(norm_material_code_scalar, return_dtype=pl.Utf8)
-            .alias(COL_PRODUCT),
+            norm_material_code_expr(COL_PRODUCT).alias(COL_PRODUCT),
             (qty * price).alias("_line_cost"),
         )
         .filter(
@@ -464,21 +468,13 @@ def build_product_cost_history(raw_pl: pl.DataFrame) -> dict[str, list[dict[str,
         None,
     )
     if quote_col:
-        qv_expr = (
-            pl.col(quote_col)
-            .map_elements(norm_material_code_scalar, return_dtype=pl.Utf8)
-            .alias("_qv")
-        )
+        qv_expr = norm_material_code_expr(quote_col).alias("_qv")
     else:
         qv_expr = pl.lit(None).cast(pl.Utf8).alias("_qv")
 
     base = df.with_columns(
-        pl.col(COL_PRODUCT)
-        .map_elements(norm_material_code_scalar, return_dtype=pl.Utf8)
-        .alias(COL_PRODUCT),
-        pl.col(COL_COMPONENT)
-        .map_elements(norm_material_code_scalar, return_dtype=pl.Utf8)
-        .alias(COL_COMPONENT),
+        norm_material_code_expr(COL_PRODUCT).alias(COL_PRODUCT),
+        norm_material_code_expr(COL_COMPONENT).alias(COL_COMPONENT),
         (qty * price).alias("_line"),
         dk_expr,
         qv_expr,
@@ -664,29 +660,15 @@ def _price_at_date(panel: dict[str, float], date: str, default: float) -> float:
 def expand_product_cost_history_dict(
     product_cost_history: dict[str, list[dict[str, Any]]],
     product_bom: dict[str, list[dict]],
-    material_trend_df: pd.DataFrame | None,
     product_price_timeline: dict[str, dict[str, dict[str, float]]] | None,
 ) -> dict[str, list[dict[str, Any]]]:
     """
     用产品价格时间线补齐「日期 → BOM材料合计 + 产品价」样本。
-    报价材料价格趋势已停用；BOM 材料合计使用当前 BOM 单价作为基准。
+    BOM 材料合计使用当前 BOM 默认单价 × 用量（报价材料价格趋势已停用）。
     """
-    material_trend_df = None
-    if material_trend_df is None or material_trend_df.empty:
-        if not product_price_timeline:
-            return dict(product_cost_history)
-    trend_df = material_trend_df
     ppt = product_price_timeline or {}
-
-    comp_panels: dict[str, dict[str, float]] = {}
-    if trend_df is not None and not trend_df.empty:
-        for comp, grp in trend_df.groupby(COL_COMPONENT, sort=False):
-            comp_s = str(comp).strip()
-            panel: dict[str, float] = {}
-            for _, r in grp.sort_values(COL_CREATEDATE).iterrows():
-                dk = str(r[COL_CREATEDATE])
-                panel[dk] = float(r[COL_UNIT_PRICE])
-            comp_panels[comp_s] = panel
+    if not ppt:
+        return dict(product_cost_history)
 
     all_products = set(product_bom.keys()) | set(product_cost_history.keys()) | set(ppt.keys())
     out: dict[str, list[dict[str, Any]]] = dict(product_cost_history)
@@ -704,6 +686,12 @@ def expand_product_cost_history_dict(
             menges[c] = float(r.get("MENGE合计") or 0)
             defaults[c] = float(r.get("组件单价") or 0)
 
+        bom_material_static = sum(
+            menges[c] * defaults.get(c, 0.0) for c in menges if menges[c] > 0
+        )
+        if bom_material_static <= 1e-12:
+            continue
+
         existing = {
             _timeline_month_key(str(h.get("date"))): h for h in out.get(product, [])
         }
@@ -712,12 +700,6 @@ def expand_product_cost_history_dict(
         }
 
         dates: set[str] = set(existing.keys()) | set(pp_tl.keys())
-        for c in menges:
-            if c in comp_panels:
-                for dk in comp_panels[c]:
-                    mk = _timeline_month_key(dk)
-                    if mk:
-                        dates.add(mk)
         if not dates:
             continue
 
@@ -725,14 +707,7 @@ def expand_product_cost_history_dict(
         for mk in sorted(dates):
             if mk in ("", "nan", "None"):
                 continue
-            bom_material = 0.0
-            for c, m in menges.items():
-                if m <= 0:
-                    continue
-                p = _price_at_date(comp_panels.get(c, {}), mk, defaults.get(c, 0.0))
-                bom_material += m * p
-            if bom_material <= 1e-12:
-                continue
+            bom_material = bom_material_static
 
             pp_kg: float | None = None
             wt_slot: float | None = None
@@ -897,6 +872,28 @@ def _aggregate_slopes(
     return float(np.nanmedian(np.array(slopes, dtype=float)))
 
 
+def _filter_slopes_mad(
+    slopes: list[float],
+    weights: list[float] | None = None,
+) -> tuple[list[float], list[float] | None]:
+    """中位数绝对偏差（MAD）自适应剔除斜率离群值；样本过少时不过滤。"""
+    if len(slopes) < SLOPE_MAD_MIN_SAMPLES:
+        return slopes, weights
+    arr = np.array(slopes, dtype=float)
+    med = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - med)))
+    if mad < 1e-12:
+        return slopes, weights
+    keep = np.abs(arr - med) <= SLOPE_MAD_K * mad
+    if not keep.any():
+        return slopes, weights
+    new_slopes = [s for s, k in zip(slopes, keep) if k]
+    if weights and len(weights) == len(slopes):
+        new_w = [w for w, k in zip(weights, keep) if k]
+        return new_slopes, new_w if new_w else None
+    return new_slopes, None
+
+
 def _robust_slopes_from_points(
     points: list[tuple[str, float, float]],
 ) -> tuple[list[float], list[float] | None]:
@@ -923,7 +920,7 @@ def _robust_slopes_from_points(
             if abs(dx) <= dx_floor:
                 continue
             s = (points[j][2] - yi) / dx
-            if not (math.isfinite(s) and -0.25 <= s <= 3.0):
+            if not math.isfinite(s):
                 continue
             slopes.append(float(s))
             if use_decay and latest_mi is not None and month_idxs[j] is not None:
@@ -932,9 +929,8 @@ def _robust_slopes_from_points(
             elif use_decay:
                 weights.append(1.0)
 
-    if use_decay and len(weights) == len(slopes):
-        return slopes, weights
-    return slopes, None
+    w_out: list[float] | None = weights if use_decay and len(weights) == len(slopes) else None
+    return _filter_slopes_mad(slopes, w_out)
 
 
 def _pass_through_from_records(
@@ -982,6 +978,7 @@ def _pool_slopes_from_history(
             pooled_w.extend(w)
         if len(pooled) >= 5000:
             break
+    pooled, pooled_w = _filter_slopes_mad(pooled, pooled_w if pooled_w else None)
     return pooled, pooled_w, n_points, n_products
 
 
@@ -1141,20 +1138,24 @@ def _extrapolation_risk(
         p_old = float(prices_old.get(comp, p_new) or 0.0)
         if p_old <= 1e-12 or abs(float(p_new) - p_old) <= 1e-9:
             continue
+        if p_old < LOW_VALUE_UNIT_PRICE_YUAN:
+            continue
 
         lo, hi = ranges.get(comp, (p_old, p_old))
-        lo = float(lo) if lo and lo > 1e-12 else p_old
-        hi = float(hi) if hi and hi > 1e-12 else p_old
+        lo = max(float(lo) if lo else p_old, LOW_VALUE_UNIT_PRICE_YUAN, p_old)
+        hi = max(float(hi) if hi else p_old, LOW_VALUE_UNIT_PRICE_YUAN, p_old)
         if p_new > hi:
-            factors.append(float(p_new) / max(hi, 1e-6))
+            factors.append(float(p_new) / max(hi, LOW_VALUE_UNIT_PRICE_YUAN))
         elif p_new < lo:
-            factors.append(lo / max(float(p_new), 1e-6))
+            factors.append(lo / max(float(p_new), LOW_VALUE_UNIT_PRICE_YUAN))
         else:
             factors.append(1.0)
 
     material_factor = 1.0
+    base_mat_eff = max(baseline_material, MIN_BASE_AMOUNT_YUAN)
+    sim_mat_eff = max(simulated_material, MIN_BASE_AMOUNT_YUAN)
     if baseline_material > 1e-12 and simulated_material > 1e-12:
-        ratio = simulated_material / baseline_material
+        ratio = sim_mat_eff / base_mat_eff
         material_factor = max(ratio, 1.0 / ratio)
         factors.append(material_factor)
 
@@ -1458,27 +1459,26 @@ def _predict_product_price_legacy(
     reg_used = primary_method.startswith("历史回归") if primary_method else False
     reg_grade = _regression_fit_grade(r2, n_hist if reg_enabled else 0)
     reg_analysis: dict[str, Any] = {
-        "是否启用": reg_enabled,
-        "是否采用为最终预测": reg_used,
-        "有效样本数": n_hist if reg_enabled else 0,
-        "BOM直接样本数": n_raw,
-        "R2": round(r2, 4) if reg_enabled else None,
-        "R2_百分比": round(r2 * 100.0, 1) if reg_enabled else None,
-        "拟合等级": reg_grade,
-        "模型": "产品价(元/KG) ≈ 截距 + 斜率 × BOM材料(元/KG)",
-        "截距": round(reg_intercept, 6) if reg_intercept is not None else None,
-        "斜率": round(reg_slope, 6) if reg_slope is not None else None,
-        "模拟点_BOM材料每公斤": round(sim_per_kg, 6) if sim_per_kg is not None else None,
-        "回归预测_产品价每公斤": (
+        "enabled": reg_enabled,
+        "used_as_primary": reg_used,
+        "valid_sample_count": n_hist if reg_enabled else 0,
+        "bom_direct_sample_count": n_raw,
+        "r2": round(r2, 4) if reg_enabled else None,
+        "r2_pct": round(r2 * 100.0, 1) if reg_enabled else None,
+        "fit_grade": reg_grade,
+        "model": "product_price_per_kg ~ intercept + slope * bom_material_per_kg",
+        "intercept": round(reg_intercept, 6) if reg_intercept is not None else None,
+        "slope": round(reg_slope, 6) if reg_slope is not None else None,
+        "sim_bom_material_per_kg": round(sim_per_kg, 6) if sim_per_kg is not None else None,
+        "reg_predicted_product_price_per_kg": (
             round(pred_reg_per_kg, 6) if pred_reg_per_kg is not None else None
         ),
-        "采用回归阈值R2": None,
-        "成本传导系数": round(pass_coef, 6) if pass_coef is not None else None,
-        "传导系数来源": pass_info.get("source") if pass_info is not None else None,
-        "传导预测_产品价每公斤": (
+        "pass_through_coefficient": round(pass_coef, 6) if pass_coef is not None else None,
+        "pass_through_source": pass_info.get("source") if pass_info is not None else None,
+        "pass_predicted_product_price_per_kg": (
             round(pred_pass_per_kg, 6) if pred_pass_per_kg is not None else None
         ),
-        "说明": (
+        "note": (
             f"共 {n_hist} 期有效样本（元/公斤口径）"
             + (f"，R²={r2:.2f}（{reg_grade}）" if reg_enabled else "；样本不足 3 期或未匹配重量，未做回归")
             + ("；回归已作为最终预测" if reg_used else "；回归仅作参考，主预测采用成本结构/成本传导" if reg_enabled else "")
@@ -1486,37 +1486,130 @@ def _predict_product_price_legacy(
     }
 
     return {
-        "预测产品价格": predicted_product,
-        "预测产品价格_每公斤": (
+        "predicted_product_price": predicted_product,
+        "predicted_product_price_per_kg": (
             round(predicted_product / weight_kg, 6)
             if predicted_product is not None and weight_kg and weight_kg > 1e-12
             else None
         ),
-        "基准产品价格": baseline_product,
-        "基准产品价格_每公斤": baseline_per_kg,
-        "产品重量_kg": round(weight_kg, 6) if weight_kg is not None else None,
-        "价格口径": PRICE_UNIT_LABEL,
-        "预测方法": primary_method,
-        "预测可信度": credibility,
-        "可信度等级": level,
-        "可信度说明": "；".join(reasons),
-        "可信度明细": {
-            "历史样本分": round(hist_score, 1),
-            "拟合优度分": round(fit_score, 1),
-            "价格区间分": round(range_score, 1),
-            "方法一致性分": round(agreement_score, 1),
-            "成本结构分": round(structure_score, 1),
-            "成本传导分": round(pass_score, 1),
-            "历史样本数": n_hist if reg_enabled else 0,
-            "回归R2": round(r2, 4) if reg_enabled else None,
-            "成本传导系数": round(pass_coef, 6) if pass_coef is not None else None,
-            "极端外推倍数": round(float(extrapolation["max_factor"]), 4),
-            "可信度封顶": cap,
-            "满分": 100.0,
+        "baseline_product_price": baseline_product,
+        "baseline_product_price_per_kg": baseline_per_kg,
+        "product_weight_kg": round(weight_kg, 6) if weight_kg is not None else None,
+        "price_unit_label": PRICE_UNIT_LABEL,
+        "primary_method": primary_method,
+        "credibility_score": credibility,
+        "credibility_level": level,
+        "credibility_reasons": reasons,
+        "credibility_breakdown": {
+            "history_sample_score": round(hist_score, 1),
+            "fit_score": round(fit_score, 1),
+            "price_range_score": round(range_score, 1),
+            "agreement_score": round(agreement_score, 1),
+            "cost_structure_score": round(structure_score, 1),
+            "pass_through_score": round(pass_score, 1),
+            "history_sample_count": n_hist if reg_enabled else 0,
+            "regression_r2": round(r2, 4) if reg_enabled else None,
+            "pass_through_coefficient": round(pass_coef, 6) if pass_coef is not None else None,
+            "extrapolation_max_factor": round(float(extrapolation["max_factor"]), 4),
+            "credibility_cap": cap,
+            "max_score": 100.0,
         },
-        "回归分析": reg_analysis,
+        "regression_analysis": reg_analysis,
+        "alternative_predictions": [
+            {"method": m, "price": round(v, 6)} for m, v, _ in candidates if m != primary_method
+        ],
+    }
+
+
+def map_sensitivity_item_en_to_zh(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "材料编码": item.get("material_code"),
+        "材料型号": item.get("material_name"),
+        "用户单价": item.get("user_price"),
+        "单价区间": item.get("price_range"),
+        "单价波动_pct": item.get("price_swing_pct"),
+        "产品价格_kg区间": item.get("product_price_kg_range"),
+        "产品价格变动_pct": item.get("product_price_change_pct"),
+    }
+
+
+def map_sensitivity_grid_en_to_zh(grid: dict[str, Any]) -> dict[str, Any]:
+    if not grid.get("available"):
+        return {
+            "可用": False,
+            "说明": grid.get("reason") or "需要至少两个改价组件",
+        }
+    comps = grid.get("components") or []
+    return {
+        "可用": True,
+        "组件": [
+            {"编码": c.get("id"), "名称": c.get("name"), "用户单价": c.get("user_price")}
+            for c in comps
+        ],
+        "扰动步长_pct": grid.get("pct_steps"),
+        "基准产品价格_kg": grid.get("baseline_per_kg"),
+        "矩阵": grid.get("matrix"),
+        "行轴": "组件A价格扰动%",
+        "列轴": "组件B价格扰动%",
+    }
+
+
+def map_regression_analysis_en_to_zh(reg: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "是否启用": reg.get("enabled"),
+        "是否采用为最终预测": reg.get("used_as_primary"),
+        "有效样本数": reg.get("valid_sample_count"),
+        "BOM直接样本数": reg.get("bom_direct_sample_count"),
+        "R2": reg.get("r2"),
+        "R2_百分比": reg.get("r2_pct"),
+        "拟合等级": reg.get("fit_grade"),
+        "模型": reg.get("model"),
+        "截距": reg.get("intercept"),
+        "斜率": reg.get("slope"),
+        "模拟点_BOM材料每公斤": reg.get("sim_bom_material_per_kg"),
+        "回归预测_产品价每公斤": reg.get("reg_predicted_product_price_per_kg"),
+        "成本传导系数": reg.get("pass_through_coefficient"),
+        "传导系数来源": reg.get("pass_through_source"),
+        "传导预测_产品价每公斤": reg.get("pass_predicted_product_price_per_kg"),
+        "说明": reg.get("note"),
+    }
+
+
+def map_legacy_predict_en_to_zh(pred: dict[str, Any]) -> dict[str, Any]:
+    """legacy 预测英文结构 → 前端中文键。"""
+    if "error" in pred:
+        return {"error": pred["error"]}
+    reg = pred.get("regression_analysis") or {}
+    alts = pred.get("alternative_predictions") or []
+    breakdown = pred.get("credibility_breakdown") or {}
+    return {
+        "预测产品价格": pred.get("predicted_product_price"),
+        "预测产品价格_每公斤": pred.get("predicted_product_price_per_kg"),
+        "基准产品价格": pred.get("baseline_product_price"),
+        "基准产品价格_每公斤": pred.get("baseline_product_price_per_kg"),
+        "产品重量_kg": pred.get("product_weight_kg"),
+        "价格口径": pred.get("price_unit_label"),
+        "预测方法": pred.get("primary_method"),
+        "预测可信度": pred.get("credibility_score"),
+        "可信度等级": pred.get("credibility_level"),
+        "可信度说明": "；".join(pred.get("credibility_reasons") or []),
+        "可信度明细": {
+            "历史样本分": breakdown.get("history_sample_score"),
+            "拟合优度分": breakdown.get("fit_score"),
+            "价格区间分": breakdown.get("price_range_score"),
+            "方法一致性分": breakdown.get("agreement_score"),
+            "成本结构分": breakdown.get("cost_structure_score"),
+            "成本传导分": breakdown.get("pass_through_score"),
+            "历史样本数": breakdown.get("history_sample_count"),
+            "回归R2": breakdown.get("regression_r2"),
+            "成本传导系数": breakdown.get("pass_through_coefficient"),
+            "极端外推倍数": breakdown.get("extrapolation_max_factor"),
+            "可信度封顶": breakdown.get("credibility_cap"),
+            "满分": breakdown.get("max_score"),
+        },
+        "回归分析": map_regression_analysis_en_to_zh(reg),
         "备选预测": [
-            {"方法": m, "价格": round(v, 6)} for m, v, _ in candidates if m != primary_method
+            {"方法": a.get("method"), "价格": a.get("price")} for a in alts
         ],
     }
 
@@ -1676,15 +1769,96 @@ def _compute_sensitivity_analysis(
             product_pct = half_spread / denom_ppk * 100.0
 
         items.append({
-            "材料编码": mat_id,
-            "材料型号": comp.get("name") or mat_id,
-            "用户单价": round(user_price, 4),
-            "单价区间": [round(price_lo, 4), round(price_hi, 4)],
-            "单价波动_pct": round(pct * 100, 1),
-            "产品价格_kg区间": [round(ppk_lo, 4), round(ppk_hi, 4)],
-            "产品价格变动_pct": round(product_pct, 2),
+            "material_code": mat_id,
+            "material_name": comp.get("name") or mat_id,
+            "user_price": round(user_price, 4),
+            "price_range": [round(price_lo, 4), round(price_hi, 4)],
+            "price_swing_pct": round(pct * 100, 1),
+            "product_price_kg_range": [round(ppk_lo, 4), round(ppk_hi, 4)],
+            "product_price_change_pct": round(product_pct, 2),
         })
     return items
+
+
+def _compute_sensitivity_grid(
+    user_modified_prices: dict,
+    component_info: list[dict],
+    point_per_kg: float,
+    *,
+    has_cost_structure: bool,
+    base_data: dict,
+    coeff: float,
+    base_for_coeff: float | None,
+    pct: float = SENSITIVITY_PCT,
+) -> dict[str, Any]:
+    """对本次改价 Top2 组件做 3×3 交叉敏感性网格（±pct）。"""
+    if len(user_modified_prices) < 2:
+        return {"available": False, "reason": "need_at_least_two_modified_components"}
+
+    ranked: list[tuple[str, dict]] = []
+    for mid, up in user_modified_prices.items():
+        mid = str(mid).strip()
+        comp = next((c for c in component_info if str(c["mat_id"]) == mid), None)
+        if comp is None:
+            continue
+        line_cost = float(comp.get("quantity") or 0) * float(up)
+        ranked.append((mid, comp))
+    ranked.sort(
+        key=lambda x: float(x[1].get("quantity") or 0) * float(user_modified_prices.get(x[0], 0)),
+        reverse=True,
+    )
+    if len(ranked) < 2:
+        return {"available": False, "reason": "insufficient_modified_components"}
+
+    id_a, comp_a = ranked[0]
+    id_b, comp_b = ranked[1]
+    base_ppk = float(point_per_kg)
+    if base_ppk <= 1e-12:
+        return {"available": False, "reason": "invalid_baseline_per_kg"}
+
+    pct_steps = [-pct, 0.0, pct]
+    pct_labels = [round(p * 100, 1) for p in pct_steps]
+    matrix: list[list[float | None]] = []
+
+    for pa in pct_steps:
+        row_vals: list[float | None] = []
+        price_a = float(user_modified_prices[id_a]) * (1.0 + pa)
+        for pb in pct_steps:
+            price_b = float(user_modified_prices[id_b]) * (1.0 + pb)
+            overrides = {id_a: price_a, id_b: price_b}
+            info = _component_info_with_prices(component_info, overrides)
+            bom = _sim_bom_from_component_info(info)
+            ppk = _point_per_kg_from_sim_bom(
+                bom,
+                has_cost_structure=has_cost_structure,
+                base_data=base_data,
+                coeff=coeff,
+                base_for_coeff=base_for_coeff,
+                base_bom_total_override=_sim_bom_from_component_info(component_info),
+            )
+            row_vals.append(round(float(ppk), 4) if ppk is not None else None)
+        matrix.append(row_vals)
+
+    return {
+        "available": True,
+        "components": [
+            {
+                "id": id_a,
+                "name": comp_a.get("name") or id_a,
+                "user_price": round(float(user_modified_prices[id_a]), 4),
+            },
+            {
+                "id": id_b,
+                "name": comp_b.get("name") or id_b,
+                "user_price": round(float(user_modified_prices[id_b]), 4),
+            },
+        ],
+        "pct_steps": pct_labels,
+        "baseline_per_kg": round(base_ppk, 4),
+        "matrix": matrix,
+        "axis_row": "component_a_pct",
+        "axis_col": "component_b_pct",
+    }
 
 
 def _compute_historical_model_error(
@@ -2143,11 +2317,12 @@ def predict_product_price(
             new_price = ref_unit
             is_fixed = False
 
-        if stat is not None and is_fixed:
+        if stat is not None and is_fixed and ref_unit >= LOW_VALUE_UNIT_PRICE_YUAN:
             hist_mean_chk = float(stat["历史均价"])
             hist_min = float(stat["历史最低"])
             hist_max = float(stat["历史最高"])
             hist_std_chk = float(stat["历史std"])
+            hist_mean_eff = max(hist_mean_chk, LOW_VALUE_UNIT_PRICE_YUAN)
 
             if hist_std_chk > 0 and mat_name not in material_warned:
                 shock_sigma = abs(new_price - hist_mean_chk) / hist_std_chk
@@ -2174,8 +2349,8 @@ def predict_product_price(
                 elif shock_sigma > 2.0:
                     score = min(score, 92)
 
-            if hist_mean_chk > 1e-12 and mat_name not in material_warned:
-                abs_ratio = abs(new_price - hist_mean_chk) / hist_mean_chk
+            if hist_mean_eff > LOW_VALUE_UNIT_PRICE_YUAN and mat_name not in material_warned:
+                abs_ratio = abs(new_price - hist_mean_chk) / hist_mean_eff
                 if abs_ratio > 5.0:
                     score = min(score, 15)
                     warnings.append(
@@ -2213,7 +2388,8 @@ def predict_product_price(
     _base_for_coeff: float = 0.0
 
     if has_cost_structure:
-        ratio = sim_bom_point / base_bom_total
+        base_eff = max(base_bom_total, MIN_BASE_AMOUNT_YUAN)
+        ratio = sim_bom_point / base_eff
         mat_piece = base_data.get("base_mat_piece") or base_mat
         labor_piece = base_data.get("base_labor_piece") or base_labor
         per_piece = bool(base_data.get("costs_are_per_piece"))
@@ -2279,6 +2455,15 @@ def predict_product_price(
         coeff=coeff,
         base_for_coeff=_base_for_coeff,
     )
+    sensitivity_grid = _compute_sensitivity_grid(
+        modified_only,
+        component_info,
+        float(point_per_kg),
+        has_cost_structure=has_cost_structure,
+        base_data=base_data,
+        coeff=coeff,
+        base_for_coeff=_base_for_coeff,
+    )
 
     # ── 步骤D：模型历史误差（回测 MAE + ±1.5×MAE，与用户调价无关）────────
     model_error_raw = _compute_historical_model_error(
@@ -2321,6 +2506,7 @@ def predict_product_price(
         "confidence_score": score,
         "warnings": warnings,
         "sensitivity": sensitivity,
+        "sensitivity_grid": sensitivity_grid,
         "model_error": model_error,
         "detail": {
             "base_mat_cost": base_mat,
@@ -2328,7 +2514,11 @@ def predict_product_price(
             "base_weight": weight,
             "base_bom_total": round(base_bom_total, 4),
             "sim_bom_point": round(sim_bom_point, 4),
-            "bom_ratio": round(sim_bom_point / base_bom_total, 6) if base_bom_total > 0 else None,
+            "bom_ratio": (
+                round(sim_bom_point / max(base_bom_total, MIN_BASE_AMOUNT_YUAN), 6)
+                if base_bom_total > 0
+                else None
+            ),
             "n_price_months": n_price_months,
             "components": component_info,
         },
