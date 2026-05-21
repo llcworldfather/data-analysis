@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BOM 成本分析工具</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root { --blue: #2563EB; --blue-light: #EFF6FF; --green: #16A34A; }
+    * { box-sizing: border-box; }
+    body { font-family: 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+
+    /* ── Dropzone ── */
+    .dropzone { transition: border-color .2s, background .2s; }
+    .dropzone.drag-over { background: var(--blue-light); border-color: var(--blue); }
+
+    /* ── Spinner ── */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner { animation: spin .75s linear infinite; }
+
+    /* ── Progress bar ── */
+    @keyframes prog-run {
+      0%   { width: 0% }
+      20%  { width: 35% }
+      50%  { width: 62% }
+      80%  { width: 85% }
+      100% { width: 93% }
+    }
+    .prog-bar { animation: prog-run 4s ease-out forwards; }
+
+    /* ── Toast ── */
+    @keyframes t-in  { from { transform: translateX(110%); opacity: 0 } to { transform: none; opacity: 1 } }
+    @keyframes t-out { from { transform: none; opacity: 1 } to { transform: translateX(110%); opacity: 0 } }
+    .t-in  { animation: t-in  .3s ease-out both }
+    .t-out { animation: t-out .3s ease-in  both }
+
+    /* ── Badge transition ── */
+    .badge { transition: background .25s, color .25s; }
+
+    /* ── Preview table ── */
+    #preview-table th { position: sticky; top: 0; z-index: 1; }
+    #preview-table td, #preview-table th { white-space: nowrap; }
+
+    /* ── Step card connector (desktop) ── */
+    @media (min-width: 768px) {
+      .step-connector::after {
+        content: '';
+        position: absolute;
+        right: -1.6rem;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 1.2rem;
+        height: 2px;
+        background: #CBD5E1;
+      }
+    }
+
+    /* ── Smooth show/hide ── */
+    .fade-in  { animation: fadeIn .3s ease-out both }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px) } to { opacity: 1; transform: none } }
+
+    /* ── Download pulse ── */
+    @keyframes pulse-blue { 0%, 100% { box-shadow: 0 0 0 0 rgba(37,99,235,.4) } 50% { box-shadow: 0 0 0 8px rgba(37,99,235,0) } }
+    .btn-pulse { animation: pulse-blue 1.8s ease-in-out 3 }
+  </style>
+</head>
+<body class="bg-slate-50 min-h-screen text-slate-800">
+
+<!-- ═══════════════════════════ NAV ═══════════════════════════ -->
+<nav class="bg-white/90 backdrop-blur border-b border-slate-200 sticky top-0 z-40">
+  <div class="max-w-6xl mx-auto px-4 sm:px-6 flex items-center justify-between h-14">
+    <div class="flex items-center gap-2.5">
+      <div class="w-7 h-7 bg-blue-600 rounded-lg flex items-center justify-center flex-shrink-0">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2"
+            d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0
+               0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0
+               002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+        </svg>
+      </div>
+      <span class="font-semibold text-base tracking-tight">BOM 成本分析</span>
+    </div>
+    <div class="hidden sm:flex items-center gap-5 text-sm text-slate-500 font-medium">
+      <a href="#guide" class="hover:text-slate-900 transition-colors">使用指南</a>
+      <a href="#faq"   class="hover:text-slate-900 transition-colors">常见问题</a>
+    </div>
+  </div>
+</nav>
+
+<!-- ═══════════════════════════ HERO ═══════════════════════════ -->
+<div class="bg-gradient-to-b from-blue-50 via-blue-50/40 to-slate-50 pt-14 pb-10 text-center px-4">
+  <span class="inline-flex items-center gap-1.5 bg-blue-100 text-blue-700 text-xs font-semibold px-3 py-1 rounded-full mb-5">
+    <span class="w-1.5 h-1.5 bg-blue-500 rounded-full"></span>
+    Excel 自动化 · 本地运行 · 数据安全
+  </span>
+  <h1 class="text-3xl sm:text-4xl lg:text-5xl font-bold text-slate-900 leading-tight mb-4">
+    三步完成 BOM 成本分析
+  </h1>
+  <p class="text-base sm:text-lg text-slate-500 max-w-lg mx-auto leading-relaxed">
+    上传标准 Excel，自动生成产品成本排名、组件占比、<br class="hidden sm:block">
+    跨产品波动等 <strong class="text-slate-700">5 张专业报表</strong>。
+  </p>
+</div>
+
+<!-- ═══════════════════════════ MAIN ═══════════════════════════ -->
+<div class="max-w-6xl mx-auto px-4 sm:px-6 pb-24 -mt-4">
+
+  <!-- ── 3-Step Cards ── -->
+  <div class="grid grid-cols-1 md:grid-cols-3 gap-5 mb-6 relative">
+
+    <!-- Step 1: Download Template -->
+    <div class="relative bg-white rounded-2xl border border-slate-200 shadow-sm p-6 step-connector">
+      <div class="flex items-center gap-3 mb-3">
+        <div id="badge-1" class="badge w-8 h-8 rounded-full bg-blue-600 text-white text-sm font-bold flex items-center justify-center flex-shrink-0">1</div>
+        <h3 class="font-semibold text-base">下载标准模板</h3>
+      </div>
+      <p class="text-slate-500 text-sm leading-relaxed mb-5">
+        下载模板后，按格式整理 BOM 数据。<br>
+        必需列：<code class="bg-slate-100 px-1 py-0.5 rounded text-xs">产品编码</code>
+        <code class="bg-slate-100 px-1 py-0.5 rounded text-xs">组件编码</code>
+        <code class="bg-slate-100 px-1 py-0.5 rounded text-xs">MENGE</code>
+        <code class="bg-slate-100 px-1 py-0.5 rounded text-xs">组件单价</code>
+      </p>
+      <a href="/api/template"
+         class="flex items-center justify-center gap-2 w-full border-2 border-blue-600 text-blue-600 font-semibold py-2.5 rounded-xl hover:bg-blue-50 active:bg-blue-100 transition-colors text-sm">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+        </svg>
+        下载模板 (.xlsx)
+      </a>
+    </div>
+
+    <!-- Step 2: Upload -->
+    <div class="relative bg-white rounded-2xl border border-slate-200 shadow-sm p-6 step-connector" id="step2-card">
+      <div class="flex items-center gap-3 mb-3">
+        <div id="badge-2" class="badge w-8 h-8 rounded-full bg-slate-200 text-slate-500 text-sm font-bold flex items-center justify-center flex-shrink-0">2</div>
+        <h3 class="font-semibold text-base">上传数据文件</h3>
+      </div>
+      <p class="text-slate-500 text-sm leading-relaxed mb-4">
+        支持同时上传多个 BOM 的 Excel；<strong class="text-slate-700">第二张「产品价格表」</strong>为可选，见<strong>本步上方黄色区域</strong>（可与 BOM 同时选），或在<strong>数据预览</strong>里补传。
+      </p>
+
+      <!-- 第二张表：始终在步骤 2 内可见（勿放在 dz-idle 内，否则上传后整块被隐藏） -->
+      <div id="optional-price-block" class="mb-4 rounded-xl border border-amber-200 bg-amber-50/80 p-4 text-left">
+        <p class="text-xs font-medium text-amber-900 mb-1">可选：产品价格历史清单（第二张 .xlsx / .xls）</p>
+        <p class="text-[11px] text-amber-800/90 mb-2 leading-relaxed">
+          每一行表示：某 <code class="bg-white/80 px-1 rounded">产品编码</code> 在某一
+          <code class="bg-white/80 px-1 rounded">报价月份</code>、某一
+          <code class="bg-white/80 px-1 rounded">重量</code> 下的
+          <code class="bg-white/80 px-1 rounded">材料成本</code>、
+          <code class="bg-white/80 px-1 rounded">工费</code>、
+          <code class="bg-white/80 px-1 rounded">总成本</code>（均为 <strong>元/公斤</strong>，合并为「产品价格」）。
+          <code class="bg-white/80 px-1 rounded">重量</code> 为产品规格（kg），用于换算整件总价。
+          与 BOM 对齐时优先按 <strong>产品+报价月份+重量</strong>，其次产品+月份或产品编码。
+          BOM 模板：<code class="bg-white/80 px-1 rounded">所属产品</code>、
+          <code class="bg-white/80 px-1 rounded">材料编码</code>、
+          <code class="bg-white/80 px-1 rounded">组件数量</code>、
+          <code class="bg-white/80 px-1 rounded">材料单价</code>（报价BOM历史清单）。
+        </p>
+        <input type="file" id="price-file-input" class="block w-full max-w-md text-xs text-slate-700 file:mr-2 file:py-1.5 file:px-2 file:rounded-lg file:border-0 file:bg-amber-100 file:text-amber-900 file:font-medium" accept=".xlsx,.xls" />
+      </div>
+      <!-- Dropzone (idle) -->
+      <div id="dz-idle"
+           class="dropzone border-2 border-dashed border-slate-300 rounded-xl p-5 text-center cursor-pointer"
+           onclick="document.getElementById('file-input').click()">
+        <div class="w-10 h-10 bg-slate-100 rounded-xl flex items-center justify-center mx-auto mb-2.5">
+          <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+          </svg>
+        </div>
+        <p class="text-slate-700 font-medium text-sm">拖拽 <strong>BOM</strong> 文件到此处</p>
+        <p class="text-slate-400 text-xs mt-1">或点击选择 · 支持多选 · .xlsx / .xls（报价BOM历史清单）</p>
+        <input type="file" id="file-input" class="hidden" accept=".xlsx,.xls" multiple />
+      </div>
+
+      <!-- Uploading -->
+      <div id="dz-uploading" class="hidden text-center py-3">
+        <div class="w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full spinner mx-auto mb-2.5"></div>
+        <p class="text-slate-600 text-sm font-medium">正在上传并解析...</p>
+      </div>
+
+      <!-- Uploaded OK -->
+      <div id="dz-done" class="hidden">
+        <div class="flex items-start gap-2.5 bg-green-50 border border-green-200 rounded-xl p-3">
+          <svg class="w-5 h-5 text-green-600 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+          </svg>
+          <div class="flex-1 min-w-0">
+            <p class="text-green-800 text-xs font-semibold" id="dz-filename">—</p>
+            <p class="text-green-600 text-xs mt-0.5" id="dz-info">—</p>
+            <!-- 多文件列表 -->
+            <ul id="dz-file-list" class="hidden mt-1.5 space-y-0.5"></ul>
+          </div>
+          <button onclick="resetAll()" class="text-green-600 hover:text-green-800 text-xs underline flex-shrink-0 ml-1 mt-0.5">重传</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 3: Download Result -->
+    <div id="step3-card" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 opacity-50 transition-opacity duration-300">
+      <div class="flex items-center gap-3 mb-3">
+        <div id="badge-3" class="badge w-8 h-8 rounded-full bg-slate-200 text-slate-500 text-sm font-bold flex items-center justify-center flex-shrink-0">3</div>
+        <h3 class="font-semibold text-base">查看 BI 分析 / 导出报告</h3>
+      </div>
+      <p class="text-slate-500 text-sm leading-relaxed mb-4">
+        分析完成后进入 <strong class="text-slate-700">BI 看板</strong>，可按组件查看各产品用量详情；也可在看板内直接导出含 5 张工作表的 Excel 报告。
+      </p>
+
+      <!-- Locked -->
+      <div id="s3-locked" class="border-2 border-dashed border-slate-200 rounded-xl py-5 text-center">
+        <svg class="w-7 h-7 text-slate-300 mx-auto mb-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+        </svg>
+        <p class="text-slate-400 text-xs">完成第 2 步后解锁</p>
+      </div>
+
+      <!-- Processing -->
+      <div id="s3-processing" class="hidden text-center py-1">
+        <div class="w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full spinner mx-auto mb-3"></div>
+        <p class="text-slate-600 text-sm font-medium mb-3">正在分析数据，请稍候...</p>
+        <div class="bg-slate-100 rounded-full h-2 overflow-hidden">
+          <div id="prog-bar" class="prog-bar h-full bg-blue-600 rounded-full w-0"></div>
+        </div>
+      </div>
+
+      <!-- Success -->
+      <div id="s3-success" class="hidden fade-in">
+        <div class="grid grid-cols-3 gap-2 mb-4">
+          <div class="bg-blue-50 rounded-xl py-3 text-center">
+            <p class="text-xl font-bold text-blue-700" id="stat-products">—</p>
+            <p class="text-xs text-blue-500 mt-0.5" id="stat-products-label">个产品</p>
+          </div>
+          <div class="bg-blue-50 rounded-xl py-3 text-center">
+            <p class="text-xl font-bold text-blue-700" id="stat-components">—</p>
+            <p class="text-xs text-blue-500 mt-0.5" id="stat-components-label">个组件</p>
+          </div>
+          <div class="bg-blue-50 rounded-xl py-3 text-center">
+            <p class="text-xl font-bold text-blue-700" id="stat-rows">—</p>
+            <p class="text-xs text-blue-500 mt-0.5">组合行</p>
+          </div>
+        </div>
+
+        <!-- 合并模式：BI 主入口 + 文本下载链接 -->
+        <div id="download-single">
+          <a id="bi-btn" href="#" target="_blank"
+             class="btn-pulse flex items-center justify-center gap-2 w-full bg-blue-600 text-white font-semibold py-3 rounded-xl hover:bg-blue-700 active:bg-blue-800 transition-colors mb-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0
+                   002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2
+                   2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+            </svg>
+            查看 BI 分析看板
+          </a>
+          <a id="sim-btn-merge" href="#" target="_blank"
+             class="flex items-center justify-center gap-2 w-full border border-indigo-200 text-indigo-700 font-medium py-2.5 rounded-xl hover:bg-indigo-50 text-sm mb-2">
+            产品成本模拟（改组件单价 → 预测原材料总成本）
+          </a>
+          <a id="download-btn" href="#"
+             class="flex items-center justify-center gap-1.5 w-full text-slate-400 hover:text-slate-600 text-xs py-1.5 transition-colors">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+            </svg>
+            直接下载 Excel 报告
+          </a>
+        </div>
+
+        <!-- 分别分析模式：每个文件一个下载按钮 -->
+        <div id="download-multiple" class="hidden space-y-2 mb-2"></div>
+
+        <button onclick="resetAll()"
+                class="w-full text-center text-slate-400 hover:text-slate-600 text-xs transition-colors py-1">
+          重新开始 →
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Data Preview Panel ── -->
+  <div id="preview-panel" class="hidden fade-in bg-white rounded-2xl border border-slate-200 shadow-sm mb-6">
+    <div class="flex flex-wrap items-start justify-between gap-4 p-5 pb-4 border-b border-slate-100">
+      <div>
+        <h3 class="font-semibold text-slate-800">数据预览 <span class="text-slate-400 font-normal text-sm" id="preview-subtitle">（前 5 行）</span></h3>
+        <p class="text-slate-400 text-xs mt-0.5">请确认数据无误，列名与内容符合预期后再开始分析。</p>
+      </div>
+      <button id="process-btn" onclick="startProcess()"
+              class="flex items-center gap-2 bg-blue-600 text-white text-sm font-semibold px-5 py-2.5 rounded-xl hover:bg-blue-700 active:bg-blue-800 transition-colors flex-shrink-0">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+        </svg>
+        确认并开始分析
+      </button>
+    </div>
+      <div class="overflow-x-auto">
+        <table id="preview-table" class="w-full text-xs text-left">
+          <thead id="preview-thead" class="bg-slate-50 text-slate-500 font-semibold border-b border-slate-200"></thead>
+          <tbody id="preview-tbody" class="divide-y divide-slate-100 text-slate-700"></tbody>
+        </table>
+      </div>
+      <div class="px-5 py-4 border-t border-amber-100 bg-amber-50/60 flex flex-wrap items-end gap-3">
+        <div class="flex-1 min-w-[200px]">
+          <p class="text-xs font-medium text-amber-900 mb-1">忘带价格表？可在此补传（不必重传 BOM）</p>
+          <input type="file" id="preview-price-input" accept=".xlsx,.xls" class="block w-full max-w-md text-xs text-slate-700 file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:bg-white file:text-amber-900" />
+        </div>
+        <button type="button" onclick="attachPriceToSession()"
+                class="flex-shrink-0 bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold px-4 py-2 rounded-lg">
+          附加价格表到本次会话
+        </button>
+      </div>
+      <p class="text-xs text-slate-400 text-right px-5 py-2">仅展示前 5 行 · 完整数据见分析报告</p>
+  </div>
+
+  <!-- ── Error Panel ── -->
+  <div id="error-panel" class="hidden fade-in bg-red-50 border border-red-200 rounded-2xl p-6 mb-6">
+    <div class="flex items-start gap-3 mb-4">
+      <div class="w-9 h-9 bg-red-100 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5">
+        <svg class="w-5 h-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+        </svg>
+      </div>
+      <div class="flex-1">
+        <h4 class="font-semibold text-red-800 mb-1">处理失败</h4>
+        <p class="text-red-700 text-sm leading-relaxed" id="err-msg">—</p>
+        <pre class="mt-2 text-red-500 text-xs font-mono bg-red-100 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap hidden" id="err-detail"></pre>
+      </div>
+    </div>
+    <div class="flex items-center gap-3">
+      <button onclick="resetAll()" class="text-sm text-red-700 font-medium hover:underline">← 重新上传</button>
+      <button onclick="toggleErrDetail()" class="text-xs text-red-400 hover:text-red-600 transition-colors" id="err-toggle">显示详情</button>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ GUIDE ═══════════════════ -->
+  <div id="guide" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-7 mb-5">
+    <h2 class="text-xl font-bold text-slate-800 mb-6">使用指南</h2>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+
+        <!-- 必需列 -->
+        <div>
+          <h3 class="text-sm font-semibold text-slate-700 uppercase tracking-wider mb-3 flex items-center gap-2">
+            <span class="w-4 h-4 rounded bg-blue-100 text-blue-600 flex items-center justify-center text-xs">✓</span>
+            必需列（支持两种命名，自动识别）
+          </h3>
+          <div class="space-y-2.5">
+            <div class="flex items-start gap-3">
+              <div class="flex gap-1 flex-shrink-0 mt-0.5">
+                <code class="bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded-md text-xs font-mono">ZMATNR</code>
+                <span class="text-slate-300 text-xs mt-0.5">或</span>
+                <code class="bg-slate-100 text-slate-700 px-2 py-0.5 rounded-md text-xs font-mono">产品编码</code>
+              </div>
+              <span class="text-slate-500 text-sm">成品/父项物料号，同一产品可有多行。</span>
+            </div>
+            <div class="flex items-start gap-3">
+              <div class="flex gap-1 flex-shrink-0 mt-0.5">
+                <code class="bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded-md text-xs font-mono">IDNRK</code>
+                <span class="text-slate-300 text-xs mt-0.5">或</span>
+                <code class="bg-slate-100 text-slate-700 px-2 py-0.5 rounded-md text-xs font-mono">组件编码</code>
+              </div>
+              <span class="text-slate-500 text-sm">BOM 子件物料号。</span>
+            </div>
+            <div class="flex items-start gap-3">
+              <code class="bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded-md text-xs font-mono flex-shrink-0 mt-0.5">MENGE</code>
+              <span class="text-slate-500 text-sm">组件用量（数量/重量），须为数值。</span>
+            </div>
+            <div class="flex items-start gap-3">
+              <div class="flex gap-1 flex-shrink-0 mt-0.5">
+                <code class="bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded-md text-xs font-mono">ZDJ</code>
+                <span class="text-slate-300 text-xs mt-0.5">或</span>
+                <code class="bg-slate-100 text-slate-700 px-2 py-0.5 rounded-md text-xs font-mono">组件单价</code>
+              </div>
+              <span class="text-slate-500 text-sm">与 MENGE 一致，通常为 <strong>元/公斤</strong>（kg 用量 × 单价 = 行成本）。</span>
+            </div>
+          </div>
+
+          <div class="mt-4 bg-blue-50 border border-blue-100 rounded-xl px-3 py-2.5 text-xs text-blue-700 leading-relaxed">
+            <strong>SAP 直接导出即可上传</strong>，系统自动识别 ZMATNR/IDNRK/ZDJ 列，无需手动改列名。其余列（ZBJNO、ZSNO、JGLX、CREATEDATE 等）自动忽略。
+          </div>
+
+          <h3 class="text-sm font-semibold text-slate-700 uppercase tracking-wider mb-3 mt-6 flex items-center gap-2">
+            <span class="w-4 h-4 rounded bg-slate-100 text-slate-500 flex items-center justify-center text-xs">+</span>
+            可选列（有则展示）
+          </h3>
+          <div class="space-y-2.5">
+            <div class="flex items-start gap-3">
+              <code class="bg-slate-100 text-slate-800 px-2 py-0.5 rounded-md text-xs font-mono flex-shrink-0 mt-0.5">MEINS</code>
+              <span class="text-slate-500 text-sm">计量单位（KG、PC 等），仅作展示。</span>
+            </div>
+            <div class="flex items-start gap-3">
+              <code class="bg-slate-100 text-slate-800 px-2 py-0.5 rounded-md text-xs font-mono flex-shrink-0 mt-0.5">MAKTX</code>
+              <span class="text-slate-500 text-sm">组件名称/描述，用于报告中展示。</span>
+            </div>
+          </div>
+        </div>
+
+      <!-- 输出工作表 -->
+      <div>
+        <h3 class="text-sm font-semibold text-slate-700 uppercase tracking-wider mb-3 flex items-center gap-2">
+          <span class="w-4 h-4 rounded bg-amber-100 text-amber-600 flex items-center justify-center text-xs font-bold">5</span>
+          输出报表工作表
+        </h3>
+        <div class="space-y-3">
+          <div class="flex items-start gap-3 p-3 bg-slate-50 rounded-xl">
+            <span class="w-5 h-5 bg-blue-600 text-white rounded flex items-center justify-center text-xs font-bold flex-shrink-0 mt-0.5">1</span>
+            <div>
+              <p class="text-sm font-medium text-slate-700">产品总成本排名</p>
+              <p class="text-xs text-slate-400 mt-0.5">每产品原材料总成本、核心成本组件及占比。</p>
+            </div>
+          </div>
+          <div class="flex items-start gap-3 p-3 bg-slate-50 rounded-xl">
+            <span class="w-5 h-5 bg-blue-600 text-white rounded flex items-center justify-center text-xs font-bold flex-shrink-0 mt-0.5">2</span>
+            <div>
+              <p class="text-sm font-medium text-slate-700">BOM 明细_占比与成本</p>
+              <p class="text-xs text-slate-400 mt-0.5">产品-组件行级用量占比与行成本，最细粒度。</p>
+            </div>
+          </div>
+          <div class="flex items-start gap-3 p-3 bg-slate-50 rounded-xl">
+            <span class="w-5 h-5 bg-blue-600 text-white rounded flex items-center justify-center text-xs font-bold flex-shrink-0 mt-0.5">3</span>
+            <div>
+              <p class="text-sm font-medium text-slate-700">组件全局成本排名</p>
+              <p class="text-xs text-slate-400 mt-0.5">跨所有产品哪个组件累计成本最高。</p>
+            </div>
+          </div>
+          <div class="flex items-start gap-3 p-3 bg-slate-50 rounded-xl">
+            <span class="w-5 h-5 bg-blue-600 text-white rounded flex items-center justify-center text-xs font-bold flex-shrink-0 mt-0.5">4</span>
+            <div>
+              <p class="text-sm font-medium text-slate-700">跨产品用量波动</p>
+              <p class="text-xs text-slate-400 mt-0.5">变异系数 CV 越大，配比一致性越差。</p>
+            </div>
+          </div>
+          <div class="flex items-start gap-3 p-3 bg-slate-50 rounded-xl">
+            <span class="w-5 h-5 bg-blue-600 text-white rounded flex items-center justify-center text-xs font-bold flex-shrink-0 mt-0.5">5</span>
+            <div>
+              <p class="text-sm font-medium text-slate-700">各产品 Top3 成本组件</p>
+              <p class="text-xs text-slate-400 mt-0.5">每个产品成本最高的前 3 个组件快速扫。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ═══════════════════ FAQ ═══════════════════ -->
+  <div id="faq" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-7">
+    <h2 class="text-xl font-bold text-slate-800 mb-6">常见问题</h2>
+    <div class="divide-y divide-slate-100">
+
+      <div class="py-4 first:pt-0">
+        <h4 class="font-medium text-slate-800 text-sm mb-1.5">上传后提示「缺少必要列」？</h4>
+        <p class="text-slate-500 text-sm leading-relaxed">
+          系统支持两套列名，满足其中之一即可：<br>
+          · SAP 导出格式：<code class="bg-slate-100 px-1 rounded">ZMATNR</code> <code class="bg-slate-100 px-1 rounded">IDNRK</code> <code class="bg-slate-100 px-1 rounded">MENGE</code> <code class="bg-slate-100 px-1 rounded">ZDJ</code><br>
+          · 标准命名格式：<code class="bg-slate-100 px-1 rounded">产品编码</code> <code class="bg-slate-100 px-1 rounded">组件编码</code> <code class="bg-slate-100 px-1 rounded">MENGE</code> <code class="bg-slate-100 px-1 rounded">组件单价</code><br>
+          若仍报错，请检查列名是否有多余空格或全角字符。
+        </p>
+      </div>
+
+      <div class="py-4 last:pb-0">
+        <h4 class="font-medium text-slate-800 text-sm mb-1.5">为什么 MENGE 为 0 的行被过滤掉了？</h4>
+        <p class="text-slate-500 text-sm leading-relaxed">分析脚本会自动过滤 MENGE ≤ 0 的行，因为用量为零的组件不参与成本计算。如有异议请检查源数据中的零值行。</p>
+      </div>
+
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<!-- Footer -->
+<footer class="text-center py-6 text-xs text-slate-400 border-t border-slate-200 bg-white">
+  BOM 成本分析工具 · 本地运行 · 数据不出本机
+</footer>
+
+<!-- ═══════════════════ MULTI-FILE MODAL ═══════════════════ -->
+<div id="multi-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm px-4">
+  <div class="bg-white rounded-2xl shadow-2xl p-7 max-w-md w-full fade-in">
+
+    <div class="flex items-center gap-3 mb-2">
+      <div class="w-10 h-10 bg-blue-100 rounded-xl flex items-center justify-center flex-shrink-0">
+        <svg class="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+        </svg>
+      </div>
+      <div>
+        <h3 class="text-base font-bold text-slate-800">检测到多个文件</h3>
+        <p class="text-slate-400 text-xs">已选择 <strong id="modal-file-count" class="text-slate-700">N</strong> 个 Excel 文件</p>
+      </div>
+    </div>
+
+    <p class="text-slate-500 text-sm mb-5 mt-1">请选择分析方式：</p>
+
+    <div class="space-y-3 mb-6">
+
+      <!-- 合并 -->
+      <button onclick="selectMode('merge')"
+              class="w-full text-left p-4 border-2 border-slate-200 rounded-xl hover:border-blue-400 hover:bg-blue-50/60 transition-all group">
+        <div class="flex items-start gap-3">
+          <div class="w-9 h-9 bg-blue-100 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 group-hover:bg-blue-200 transition-colors">
+            <svg class="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M4 6h16M4 10h16M4 14h16M4 18h16"/>
+            </svg>
+          </div>
+          <div>
+            <p class="font-semibold text-slate-700 text-sm">合并成一份报告</p>
+            <p class="text-xs text-slate-400 mt-0.5">所有文件数据合并后统一分析，生成 <strong class="text-slate-600">1 个</strong> 报告文件。<br>跨文件相同「产品+组件」会汇总成一行。</p>
+          </div>
+        </div>
+      </button>
+
+      <!-- 分别 -->
+      <button onclick="selectMode('per_file')"
+              class="w-full text-left p-4 border-2 border-slate-200 rounded-xl hover:border-violet-400 hover:bg-violet-50/60 transition-all group">
+        <div class="flex items-start gap-3">
+          <div class="w-9 h-9 bg-violet-100 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 group-hover:bg-violet-200 transition-colors">
+            <svg class="w-5 h-5 text-violet-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2"/>
+            </svg>
+          </div>
+          <div>
+            <p class="font-semibold text-slate-700 text-sm">每个文件单独一份报告</p>
+            <p class="text-xs text-slate-400 mt-0.5">每个 Excel 各自独立分析，共生成 <strong id="modal-report-count" class="text-slate-600">N</strong> 份报告，互不混入数据。</p>
+          </div>
+        </div>
+      </button>
+
+    </div>
+
+    <button onclick="cancelModal()"
+            class="w-full text-center text-slate-400 hover:text-slate-600 text-sm transition-colors py-1">
+      取消
+    </button>
+  </div>
+</div>
+
+<!-- Toast Container -->
+<div id="toast-wrap" class="fixed top-4 right-4 z-50 flex flex-col gap-2 pointer-events-none"></div>
+
+
+<!-- ═══════════════════════════ SCRIPT ═══════════════════════════ -->
+<script>
+/* ── State ── */
+let APP = {
+  state:          'idle',
+  sessionId:      null,
+  mode:           'merge',   // 'merge' | 'per_file'
+  downloadToken:  null,
+  downloadTokens: null,      // per_file 模式下的多个 token
+  pendingFiles:   null,      // 等待弹窗确认的文件列表
+  priceFile:         null,  // 可选：产品价格历史清单
+};
+
+/* ── Dropzone drag events ── */
+const dz = document.getElementById('dz-idle');
+dz.addEventListener('dragover',  e => { e.preventDefault(); dz.classList.add('drag-over'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+dz.addEventListener('drop', e => {
+  e.preventDefault();
+  dz.classList.remove('drag-over');
+  const files = [...e.dataTransfer.files];
+  if (files.length) handleFiles(files);
+});
+document.getElementById('file-input').addEventListener('change', e => {
+  const files = [...e.target.files];
+  if (files.length) handleFiles(files);
+});
+document.getElementById('price-file-input').addEventListener('change', async e => {
+  const f = e.target.files && e.target.files[0];
+  APP.priceFile = f || null;
+  if (f) toast('已选择产品价格表：' + f.name, 'info');
+  /* 若已上传 BOM 并处于预览：立即把第二张表写入会话（否则仅选文件不会传到服务器） */
+  if (f && APP.sessionId && APP.state === 'preview') {
+    try {
+      const data = await postAttachPrice(f);
+      appendPriceLineToDzInfo(data.price_filename || f.name);
+      e.target.value = '';
+      APP.priceFile = null;
+      toast('价格表已绑定到本次会话，可点「确认并开始分析」', 'success');
+    } catch (err) {
+      toast(err.message || String(err), 'error');
+      APP.priceFile = null;
+      e.target.value = '';
+    }
+  }
+});
+/* ── 处理选中的文件列表 ── */
+function handleFiles(files) {
+  const xlsx = files.filter((f) => {
+    const n = f.name.toLowerCase();
+    return n.endsWith('.xlsx') || (n.endsWith('.xls') && !n.endsWith('.xlsx'));
+  });
+  if (xlsx.length === 0) {
+    toast('格式错误：仅支持 .xlsx / .xls 文件', 'error');
+    return;
+  }
+  if (xlsx.length < files.length) {
+    toast(`已过滤 ${files.length - xlsx.length} 个非 Excel 文件`, 'info');
+  }
+  if (xlsx.some(f => f.size > 100 * 1024 * 1024)) {
+    toast('文件过大：单文件最大支持 100 MB', 'error');
+    return;
+  }
+
+  if (xlsx.length > 1) {
+    APP.pendingFiles = xlsx;
+    showMultiModal(xlsx.length);
+  } else {
+    uploadFiles(xlsx, 'merge');
+  }
+}
+
+/* ── 多文件弹窗 ── */
+function showMultiModal(count) {
+  document.getElementById('modal-file-count').textContent  = count;
+  document.getElementById('modal-report-count').textContent = count;
+  document.getElementById('multi-modal').classList.remove('hidden');
+}
+
+function selectMode(mode) {
+  document.getElementById('multi-modal').classList.add('hidden');
+  const files = APP.pendingFiles;
+  APP.pendingFiles = null;
+  uploadFiles(files, mode);
+}
+
+function cancelModal() {
+  document.getElementById('multi-modal').classList.add('hidden');
+  APP.pendingFiles = null;
+  document.getElementById('file-input').value = '';
+}
+
+/* ── 上传文件到服务器 ── */
+async function uploadFiles(files, mode) {
+  if (!files || files.length === 0) {
+    toast('未选择文件，请重新选择', 'error');
+    return;
+  }
+  APP.mode = mode;
+  setView('uploading');
+  toast(`正在上传 ${files.length} 个文件，请稍候…`, 'info');
+
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  if (APP.priceFile) fd.append('price_file', APP.priceFile);
+
+  let res, data;
+  try {
+    res = await fetch('/api/upload', { method: 'POST', body: fd });
+  } catch (err) {
+    showError('无法连接到服务器，请确认服务已启动（双击 start_web.bat）', String(err));
+    setView('error');
+    return;
+  }
+  try {
+    data = await res.json();
+  } catch (err) {
+    showError(
+      `服务器返回了异常响应（HTTP ${res.status}），请查看服务器窗口的报错信息后重试`,
+      String(err)
+    );
+    setView('error');
+    return;
+  }
+
+  if (!res.ok) {
+    showError(data.error || '上传失败', data.detail || data.hint);
+    setView('error');
+    return;
+  }
+
+  APP.sessionId = data.session_id;
+
+  /* dz-done 区域 */
+  if (data.file_count === 1) {
+    document.getElementById('dz-filename').textContent = data.filenames[0];
+    let info = `${data.total_rows.toLocaleString()} 行 · ${data.columns.length} 列`;
+    if (data.has_price && data.price_filename) {
+      info += ` · 已附价格表：${data.price_filename}`;
+    }
+    document.getElementById('dz-info').textContent = info;
+    show('dz-file-list', false);
+  } else {
+    document.getElementById('dz-filename').textContent =
+      `${data.file_count} 个文件 · ${mode === 'merge' ? '合并分析' : '分别分析'}`;
+    let info2 = `首个文件 ${data.total_rows.toLocaleString()} 行 · ${data.columns.length} 列`;
+    if (data.has_price && data.price_filename) {
+      info2 += ` · 已附价格表：${data.price_filename}`;
+    }
+    document.getElementById('dz-info').textContent = info2;
+    const ul = document.getElementById('dz-file-list');
+    ul.innerHTML = data.filenames.map(n =>
+      `<li class="text-green-700 text-xs truncate">· ${esc(n)}</li>`
+    ).join('');
+    show('dz-file-list', true);
+  }
+
+  /* 预览副标题 */
+  document.getElementById('preview-subtitle').textContent =
+    data.file_count > 1 ? `（首个文件前 5 行）` : `（前 5 行）`;
+
+  renderPreview(data);
+  setView('preview');
+  toast('文件解析成功，请核对预览数据', 'success');
+}
+
+/* ── 预览阶段补传第二张价格表（不重新传 BOM） ── */
+async function postAttachPrice(file) {
+  const fd = new FormData();
+  fd.append('session_id', APP.sessionId);
+  fd.append('price_file', file);
+  const res = await fetch('/api/session/attach_price', { method: 'POST', body: fd });
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    throw new Error('服务器响应异常（HTTP ' + res.status + '）');
+  }
+  if (!res.ok) throw new Error(data.error || '附加失败');
+  return data;
+}
+
+function appendPriceLineToDzInfo(fname) {
+  const el = document.getElementById('dz-info');
+  if (!el) return;
+  let t = el.textContent.replace(/\s*·\s*已附价格表：.*$/, '').trim();
+  el.textContent = t + ' · 已附价格表：' + fname;
+}
+
+async function attachPriceToSession() {
+  if (!APP.sessionId) {
+    toast('请先完成 BOM 上传', 'error');
+    return;
+  }
+  const inp = document.getElementById('preview-price-input');
+  const f = inp && inp.files && inp.files[0];
+  if (!f) {
+    toast('请先选择价格表 .xlsx / .xls', 'error');
+    return;
+  }
+  const plow = f.name.toLowerCase();
+  if (!plow.endsWith('.xlsx') && !(plow.endsWith('.xls') && !plow.endsWith('.xlsx'))) {
+    toast('价格表仅支持 .xlsx / .xls', 'error');
+    return;
+  }
+  try {
+    const data = await postAttachPrice(f);
+    appendPriceLineToDzInfo(data.price_filename || f.name);
+    APP.priceFile = f;
+    inp.value = '';
+    toast('价格表已绑定到本次会话，可点「确认并开始分析」', 'success');
+  } catch (err) {
+    toast(err.message || String(err), 'error');
+  }
+}
+
+/* ── 渲染预览表格 ── */
+function renderPreview(data) {
+  const thead = document.getElementById('preview-thead');
+  const tbody = document.getElementById('preview-tbody');
+  thead.innerHTML = '<tr>' +
+    data.columns.map(c =>
+      `<th class="px-4 py-2.5 text-left text-xs font-semibold border-b border-slate-200 bg-slate-50 text-slate-500">${esc(c)}</th>`
+    ).join('') + '</tr>';
+  tbody.innerHTML = data.rows.map((row, i) =>
+    `<tr class="${i % 2 ? 'bg-slate-50/60' : 'bg-white'}">` +
+    row.map(cell =>
+      `<td class="px-4 py-2.5 text-xs text-slate-700">${esc(cell)}</td>`
+    ).join('') + '</tr>'
+  ).join('');
+}
+
+/* ── 开始分析 ── */
+async function startProcess() {
+  if (!APP.sessionId) return;
+  setView('processing');
+  toast('正在分析数据，请稍候…', 'info');
+
+  let res, data;
+  try {
+    res = await fetch('/api/process', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ session_id: APP.sessionId, mode: APP.mode }),
+    });
+  } catch (err) {
+    showError('无法连接到服务器，请确认服务已启动', String(err));
+    setView('error');
+    return;
+  }
+  try {
+    data = await res.json();
+  } catch (err) {
+    showError(
+      `服务器返回了异常响应（HTTP ${res.status}），请查看服务器窗口的报错信息后重试`,
+      String(err)
+    );
+    setView('error');
+    return;
+  }
+
+  if (!res.ok) {
+    showError(data.error || '分析失败', data.detail);
+    setView('error');
+    return;
+  }
+
+  document.getElementById('stat-rows').textContent = data.stats.total_rows;
+
+  if (data.mode === 'per_file') {
+    /* 分别分析模式 */
+    APP.downloadTokens = data.download_tokens;
+    document.getElementById('stat-products').textContent        = data.stats.files;
+    document.getElementById('stat-products-label').textContent  = '份报告';
+    document.getElementById('stat-components').textContent      = '—';
+    document.getElementById('stat-components-label').textContent = '—';
+
+    /* 渲染多个下载按钮 */
+    const container = document.getElementById('download-multiple');
+    container.innerHTML = data.download_tokens.map(t => `
+      <div class="space-y-1">
+        <a href="/bi/${esc(t.token)}" target="_blank"
+           class="flex items-center gap-2 w-full bg-blue-600 text-white text-sm font-semibold px-4 py-2.5 rounded-xl hover:bg-blue-700 active:bg-blue-800 transition-colors">
+          <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0
+                 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0
+                 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+          </svg>
+          <span class="truncate flex-1 min-w-0">${esc(t.filename)}</span>
+          <span class="text-blue-200 text-xs flex-shrink-0">${t.stats.products} 产品 · BI分析</span>
+        </a>
+        <a href="/sim/${esc(t.token)}" target="_blank"
+           class="flex items-center justify-center w-full text-indigo-600 hover:text-indigo-800 text-xs font-medium py-0.5">
+          成本模拟 →
+        </a>
+        <a href="/api/download/${esc(t.token)}"
+           class="flex items-center justify-center gap-1.5 w-full text-slate-400 hover:text-slate-600 text-xs py-1 transition-colors">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+          </svg>
+          直接下载 Excel
+        </a>
+      </div>`
+    ).join('');
+
+    show('download-single',   false);
+    show('download-multiple', true);
+
+  } else {
+    /* 合并模式 */
+    APP.downloadToken = data.download_token;
+    document.getElementById('stat-products').textContent        = data.stats.products;
+    document.getElementById('stat-products-label').textContent  = '个产品';
+    document.getElementById('stat-components').textContent      = data.stats.components;
+    document.getElementById('stat-components-label').textContent = '个组件';
+    document.getElementById('download-btn').href = `/api/download/${APP.downloadToken}`;
+    document.getElementById('bi-btn').href = `/bi/${APP.downloadToken}`;
+    document.getElementById('sim-btn-merge').href = `/sim/${APP.downloadToken}`;
+
+    show('download-single',   true);
+    show('download-multiple', false);
+  }
+
+  setView('success');
+  toast('分析完成！报告已就绪，请下载。', 'success');
+}
+
+/* ── 视图状态机 ── */
+function setView(v) {
+  APP.state = v;
+
+  show('dz-idle',      v === 'idle');
+  show('dz-uploading', v === 'uploading');
+  show('dz-done',      ['preview','processing','success','error'].includes(v));
+
+  show('s3-locked',     ['idle','uploading','preview'].includes(v));
+  show('s3-processing', v === 'processing');
+  show('s3-success',    v === 'success');
+
+  const s3 = document.getElementById('step3-card');
+  s3.classList.toggle('opacity-50', ['idle','uploading'].includes(v));
+
+  show('preview-panel', v === 'preview');
+  show('error-panel',   v === 'error');
+
+  setBadge('badge-2',
+    v === 'idle'      ? 'idle'   :
+    v === 'uploading' ? 'active' :
+    ['preview','processing','success','error'].includes(v) ? 'done' : 'idle');
+  setBadge('badge-3',
+    v === 'processing' ? 'active' :
+    v === 'success'    ? 'done'   : 'idle');
+
+  if (v === 'processing') {
+    const pb = document.getElementById('prog-bar');
+    pb.style.animation = 'none';
+    void pb.offsetWidth;
+    pb.style.animation = 'prog-run 4s ease-out forwards';
+  }
+}
+
+function show(id, visible) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.toggle('hidden', !visible);
+}
+
+function setBadge(id, mode) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = 'badge w-8 h-8 rounded-full text-sm font-bold flex items-center justify-center flex-shrink-0 ' + {
+    idle:   'bg-slate-200 text-slate-500',
+    active: 'bg-blue-600 text-white',
+    done:   'bg-green-600 text-white',
+  }[mode];
+}
+
+/* ── 错误展示 ── */
+function showError(msg, detail) {
+  document.getElementById('err-msg').textContent = msg || '未知错误';
+  const det = document.getElementById('err-detail');
+  if (detail) {
+    det.textContent = detail;
+    det.classList.remove('hidden');
+    document.getElementById('err-toggle').textContent = '隐藏详情';
+  } else {
+    det.textContent = '';
+    det.classList.add('hidden');
+    document.getElementById('err-toggle').textContent = '显示详情';
+  }
+}
+
+function toggleErrDetail() {
+  const det    = document.getElementById('err-detail');
+  const btn    = document.getElementById('err-toggle');
+  const hidden = det.classList.toggle('hidden');
+  btn.textContent = hidden ? '显示详情' : '隐藏详情';
+}
+
+/* ── 重置 ── */
+function resetAll() {
+  APP.sessionId      = null;
+  APP.downloadToken  = null;
+  APP.downloadTokens = null;
+  APP.mode           = 'merge';
+  APP.priceFile         = null;
+  document.getElementById('file-input').value           = '';
+  document.getElementById('price-file-input').value      = '';
+  const ppi = document.getElementById('preview-price-input');
+  if (ppi) ppi.value = '';
+  document.getElementById('preview-thead').innerHTML    = '';
+  document.getElementById('preview-tbody').innerHTML    = '';
+  document.getElementById('err-msg').textContent        = '—';
+  document.getElementById('err-detail').textContent     = '';
+  document.getElementById('err-detail').classList.add('hidden');
+  document.getElementById('download-multiple').innerHTML = '';
+  setView('idle');
+}
+
+/* ── Toast ── */
+function toast(msg, type = 'info') {
+  const wrap  = document.getElementById('toast-wrap');
+  const el    = document.createElement('div');
+  const color = { success: 'bg-green-600', error: 'bg-red-600', info: 'bg-slate-700' }[type];
+  const icon  = { success: '✓', error: '✕', info: 'i' }[type];
+  el.className = `t-in pointer-events-auto flex items-center gap-3 ${color} text-white text-sm font-medium px-4 py-3 rounded-xl shadow-lg max-w-xs`;
+  el.innerHTML = `<span class="w-5 h-5 bg-white/25 rounded-full flex items-center justify-center text-xs flex-shrink-0">${icon}</span><span>${esc(msg)}</span>`;
+  wrap.appendChild(el);
+  setTimeout(() => {
+    el.classList.replace('t-in', 't-out');
+    setTimeout(() => el.remove(), 300);
+  }, 3500);
+}
+
+/* ── Escape HTML ── */
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,645 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>产品成本模拟 · BOM</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    body { font-family: 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+    .num { font-variant-numeric: tabular-nums; }
+    .metric-bar { height: 8px; border-radius: 4px; background: #E2E8F0; overflow: hidden; }
+    .metric-bar-fill { height: 100%; border-radius: 4px; transition: width .35s ease; }
+  </style>
+</head>
+<body class="bg-slate-50 min-h-screen text-slate-800">
+  <nav class="bg-white border-b border-slate-200 sticky top-0 z-10">
+    <div class="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between">
+      <div class="flex items-center gap-3 text-sm">
+        <a href="/bi/{{ token }}" class="text-indigo-600 hover:underline">← 返回 BI 看板</a>
+        <span class="text-slate-300">|</span>
+        <span class="font-semibold text-slate-700">产品成本模拟与价格预测</span>
+      </div>
+      <a href="/" class="text-xs text-slate-500 hover:text-slate-800">首页</a>
+    </div>
+  </nav>
+
+  <main class="max-w-6xl mx-auto px-4 py-8">
+    <p class="text-sm text-slate-600 mb-6">
+      修改各组件<strong>材料单价</strong>后，系统会<strong>预测该产品的报价/总成本</strong>，并给出三个独立维度的结果：
+      <br><span class="text-slate-700">・<strong>敏感性分析</strong></span>（调价后显示）：若某组件单价在您输入值 ±10% 范围内波动，产品价格大约变动多少。
+      <br><span class="text-slate-700">・<strong>模型历史误差</strong></span>（始终显示）：用历史月份回测（剔除材料成本异常跳变月），以稳健 MAE 给出「点估计 ±1.5×MAE」区间，反映公式本身精度，与是否调价无关。
+      <br><span class="text-slate-700">・<strong>模型可信度</strong></span>：反映本次调价在历史数据中的支撑程度。
+      <br>材料单价、价格清单中的成本均为<strong>元/公斤</strong>；产品总价 = 每公斤价 × <strong>重量(kg)</strong>。
+      建议同时上传：<strong>报价BOM历史清单</strong>和<strong>产品价格历史清单</strong>。
+    </p>
+
+    <div class="flex flex-wrap gap-4 items-end mb-6">
+      <div class="min-w-[260px] flex-1 relative">
+        <label class="block text-xs font-medium text-slate-500 mb-1">产品编码（所属产品）</label>
+        <input type="text" id="product-input" autocomplete="off" spellcheck="false"
+               placeholder="输入编码筛选或粘贴完整编码"
+               class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white font-mono" />
+        <div id="product-suggest" role="listbox"
+             class="hidden absolute left-0 right-0 top-full mt-0.5 z-50 max-h-64 overflow-y-auto bg-white border border-slate-200 rounded-lg shadow-lg text-sm"></div>
+        <p id="product-meta" class="text-[11px] text-slate-400 mt-1 leading-relaxed"></p>
+      </div>
+      <button type="button" id="btn-load" class="px-4 py-2 rounded-lg bg-slate-800 text-white text-sm font-medium hover:bg-slate-900">加载 BOM</button>
+      <button type="button" id="btn-sim" class="px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700">计算预测产品价</button>
+      <button type="button" id="btn-reset" class="px-4 py-2 rounded-lg border border-slate-300 text-sm text-slate-700 hover:bg-slate-100">单价恢复为当前值</button>
+    </div>
+
+    <div id="summary" class="hidden grid sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div class="lg:col-span-2 bg-indigo-600 text-white rounded-xl p-5 shadow-md">
+        <div class="text-xs text-indigo-100">预测产品价格（主结果）</div>
+        <div id="v-pred-product" class="text-3xl font-bold num mt-1">—</div>
+        <div id="v-pred-method" class="text-[11px] text-indigo-200 mt-2">—</div>
+      </div>
+      <div class="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
+        <div class="text-xs text-slate-500">基准产品总价（元/件，来自价格清单）</div>
+        <div id="v-prod-price" class="text-xl font-bold text-slate-900 num mt-1">—</div>
+        <div id="v-quote-context" class="text-[10px] text-slate-500 mt-1 leading-snug">—</div>
+        <div id="v-pred-diff" class="text-xs text-slate-500 mt-1 num">差额 —</div>
+      </div>
+      <div class="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
+        <div class="text-xs text-slate-500">BOM 材料合计（对照）</div>
+        <div id="v-sim" class="text-lg font-bold text-slate-700 num mt-1">—</div>
+        <div class="text-[10px] text-slate-400 mt-1">基线 <span id="v-orig" class="num">—</span></div>
+      </div>
+    </div>
+
+    <div id="metrics-panel" class="hidden mb-6 grid lg:grid-cols-3 gap-4">
+      <!-- 可信度面板 -->
+      <div class="rounded-xl border-2 border-indigo-200 bg-indigo-50/40 p-5 shadow-sm">
+        <div class="text-sm font-semibold text-slate-800 mb-3">模型可信度</div>
+        <div class="flex flex-wrap items-end gap-3 mb-4">
+          <span id="cred-score" class="text-4xl font-bold num text-indigo-800 leading-none">—</span>
+          <span class="text-sm text-slate-500 pb-1">/ 100</span>
+          <span id="cred-level" class="text-xs font-semibold px-2.5 py-1 rounded-full bg-white border border-slate-200 text-slate-700 mb-0.5">—</span>
+        </div>
+        <div class="metric-bar mb-4" title="综合可信度">
+          <div id="cred-bar-fill" class="metric-bar-fill bg-indigo-500" style="width:0%"></div>
+        </div>
+        <div id="cred-method" class="text-[11px] text-slate-500 mb-3">预测方法：—</div>
+        <div id="cred-warnings" class="space-y-1.5 text-[11px]"></div>
+        <p id="cred-desc" class="text-xs text-slate-600 mt-3 leading-relaxed border-t border-indigo-100 pt-3">—</p>
+      </div>
+      <!-- 敏感性分析（用户调价后） -->
+      <div class="rounded-xl border-2 border-amber-200 bg-amber-50/40 p-5 shadow-sm">
+        <div class="text-sm font-semibold text-slate-800 mb-3">敏感性分析</div>
+        <p class="text-[10px] text-slate-500 mb-2 leading-snug">
+          假设<strong>您改价的组件</strong>单价在输入值 <strong>±10%</strong> 内继续波动，<strong>其他组件单价不变</strong>，推算产品价（元/kg）的波动区间。
+        </p>
+        <p id="sensitivity-compare" class="text-[10px] text-amber-900/90 mb-3 leading-snug border-l-2 border-amber-400 pl-2 bg-amber-50/60 rounded-r">
+          与右侧「模型历史误差」区间可能数值接近，但含义不同：本卡片是<strong>调价情景下的局部敏感性</strong>，不是历史回测精度。
+        </p>
+        <div id="sensitivity-body" class="text-xs text-slate-600 space-y-3 leading-relaxed">
+          <p class="text-slate-400">修改组件单价并点击「计算预测产品价」后显示</p>
+        </div>
+      </div>
+      <!-- 模型历史误差（始终显示，与调价无关） -->
+      <div class="rounded-xl border-2 border-emerald-200 bg-emerald-50/40 p-5 shadow-sm">
+        <div class="text-sm font-semibold text-slate-800 mb-3">模型历史误差</div>
+        <p class="text-[10px] text-slate-500 mb-2 leading-snug">
+          <strong>与当前是否调价无关</strong>：用历史各月 BOM 回测公式，看预测价相对实际价（元/kg）的典型偏差。
+        </p>
+        <p id="model-error-compare" class="text-[10px] text-emerald-900/90 mb-3 leading-snug border-l-2 border-emerald-400 pl-2 bg-emerald-50/60 rounded-r">
+          与左侧「敏感性分析」区间可能数值接近，但含义不同：本卡片反映<strong>公式本身</strong>的历史平均偏差（见下方 MAE），不是组件再浮动 ±10% 的结果。
+        </p>
+        <dl class="grid grid-cols-2 gap-x-3 gap-y-2 text-[11px] mb-3">
+          <div><dt class="text-slate-500">MAE（稳健）</dt><dd id="model-rmse" class="font-semibold num text-emerald-800">—</dd></div>
+          <div><dt class="text-slate-500">回测样本</dt><dd id="model-n" class="font-semibold num text-slate-800">—</dd></div>
+        </dl>
+        <div class="mb-2">
+          <div class="text-xs text-slate-500 mb-1">预测区间（点估计 ±1.5×MAE，元/kg）</div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <span id="model-interval-lo" class="text-lg font-bold num text-emerald-800">—</span>
+            <span class="text-slate-400 text-sm">～</span>
+            <span id="model-interval-hi" class="text-lg font-bold num text-emerald-800">—</span>
+          </div>
+        </div>
+        <p id="model-error-desc" class="text-xs text-slate-600 leading-relaxed border-t border-emerald-100 pt-3">—</p>
+      </div>
+    </div>
+
+    <div id="err" class="hidden mb-4 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-4 py-3"></div>
+
+    <div class="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead class="bg-slate-100 text-slate-600 text-left">
+            <tr>
+              <th class="px-3 py-2 font-medium">材料编码</th>
+              <th class="px-3 py-2 font-medium">材料型号</th>
+              <th class="px-3 py-2 font-medium text-right">组件数量</th>
+              <th class="px-3 py-2 font-medium text-right">材料单价（当前）</th>
+              <th class="px-3 py-2 font-medium text-right">模拟单价</th>
+              <th class="px-3 py-2 font-medium text-right">边际(单价+1)</th>
+              <th class="px-3 py-2 font-medium text-right">占材料合计%</th>
+              <th class="px-3 py-2 font-medium text-right">模拟行成本</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+      <p id="empty-hint" class="text-sm text-slate-500 p-6 text-center">请先选择产品并点击「加载 BOM」。</p>
+    </div>
+  </main>
+
+  <script>
+    const TOKEN = "{{ token }}";
+    const API = (path) => path.replace("{t}", TOKEN);
+
+    let currentProduct = "";
+    let baselineTotal = 0;
+    let refTotalCost = null;
+    let defaultPrices = {};
+    let lineState = {};
+
+    let searchRequired = false;
+    let productIds = [];
+    let totalProducts = 0;
+    let minQLen = 2;
+    let debounceTimer = null;
+
+    function esc(s) {
+      return String(s ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function showErr(msg) {
+      const el = document.getElementById("err");
+      el.textContent = msg || "";
+      el.classList.toggle("hidden", !msg);
+    }
+
+    function hideSuggest() {
+      const box = document.getElementById("product-suggest");
+      box.classList.add("hidden");
+      box.innerHTML = "";
+    }
+
+    function renderSuggest(ids) {
+      const box = document.getElementById("product-suggest");
+      if (!ids || ids.length === 0) {
+        box.classList.add("hidden");
+        box.innerHTML = "";
+        return;
+      }
+      box.innerHTML = ids
+        .map(
+          (id) =>
+            `<button type="button" role="option" data-id="${esc(id)}" class="product-sug-item w-full text-left px-3 py-2 font-mono text-xs hover:bg-indigo-50 border-b border-slate-50 last:border-0">${esc(id)}</button>`
+        )
+        .join("");
+      box.classList.remove("hidden");
+      box.querySelectorAll(".product-sug-item").forEach((btn) => {
+        btn.addEventListener("click", () => pickProduct(btn.getAttribute("data-id") || ""));
+      });
+    }
+
+    function pickProduct(id) {
+      document.getElementById("product-input").value = id;
+      hideSuggest();
+      showErr("");
+    }
+
+    function localMatches(query) {
+      const q = query.trim();
+      if (!productIds.length) return [];
+      if (!q) return productIds.slice(0, 80);
+      const out = [];
+      for (const p of productIds) {
+        if (p.includes(q)) {
+          out.push(p);
+          if (out.length >= 80) break;
+        }
+      }
+      return out;
+    }
+
+    async function loadProductsMeta() {
+      const res = await fetch(API("/api/bi/products/{t}"));
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || res.statusText);
+      totalProducts = j.total ?? j.count ?? 0;
+      searchRequired = !!j.search_required;
+      minQLen = j.min_q_len != null ? j.min_q_len : 2;
+      productIds = (j.products || []).map((p) => String(p.id));
+      document.getElementById("product-meta").textContent = searchRequired
+        ? `共 ${totalProducts.toLocaleString()} 个产品，请输入至少 ${minQLen} 位编码片段。`
+        : `共 ${totalProducts.toLocaleString()} 个产品，输入关键字可本地筛选。`;
+    }
+
+    async function remoteSearch(query) {
+      const res = await fetch(API("/api/bi/products/{t}?") + new URLSearchParams({ q: query.trim(), limit: "80" }));
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || res.statusText);
+      return (j.products || []).map((p) => String(p.id));
+    }
+
+    function scheduleSuggestUpdate() {
+      const q = document.getElementById("product-input").value;
+      if (debounceTimer) clearTimeout(debounceTimer);
+      if (!searchRequired) {
+        renderSuggest(localMatches(q));
+        return;
+      }
+      if (q.trim().length < minQLen) {
+        hideSuggest();
+        return;
+      }
+      debounceTimer = setTimeout(() => {
+        remoteSearch(q).then(renderSuggest).catch((e) => showErr(e.message));
+      }, 320);
+    }
+
+    function fmt(n) {
+      if (n == null || Number.isNaN(n)) return "—";
+      return Number(n).toLocaleString("zh-CN", { maximumFractionDigits: 4 });
+    }
+
+    function barRow(label, score, maxScore, colorClass) {
+      const pct = maxScore > 0 ? Math.min(100, (score / maxScore) * 100) : 0;
+      return (
+        '<div class="flex items-center gap-2">' +
+        '<span class="w-20 shrink-0 text-slate-500">' + esc(label) + "</span>" +
+        '<div class="metric-bar flex-1"><div class="metric-bar-fill ' + colorClass + '" style="width:' + pct + '%"></div></div>' +
+        '<span class="w-10 text-right num font-medium text-slate-700">' + (score != null ? Number(score).toFixed(1) : "—") + "</span>" +
+        "</div>"
+      );
+    }
+
+    function setMetricsUI(j) {
+      const panel = document.getElementById("metrics-panel");
+      panel.classList.remove("hidden");
+
+      // ── 可信度面板 ──────────────────────────────────────────────────────
+      const cred = j.预测可信度 != null ? Number(j.预测可信度) : null;
+      const scoreEl = document.getElementById("cred-score");
+      const levelEl = document.getElementById("cred-level");
+      const credBar = document.getElementById("cred-bar-fill");
+      if (cred == null || Number.isNaN(cred)) {
+        scoreEl.textContent = "—";
+        levelEl.textContent = "—";
+        credBar.style.width = "0%";
+      } else {
+        scoreEl.textContent = String(cred);
+        scoreEl.className =
+          "text-4xl font-bold num leading-none " +
+          (cred >= 90 ? "text-emerald-700" : cred >= 65 ? "text-amber-600" : cred >= 40 ? "text-orange-600" : "text-red-700");
+        levelEl.textContent = j.可信度等级 || (cred >= 90 ? "高" : cred >= 65 ? "中等" : cred >= 40 ? "较低，建议参考" : "低，仅供参考");
+        const levelColors = {
+          "高": "bg-emerald-100 text-emerald-800 border-emerald-300",
+          "中等": "bg-amber-100 text-amber-800 border-amber-300",
+          "较低，建议参考": "bg-orange-100 text-orange-800 border-orange-300",
+          "低，仅供参考": "bg-red-100 text-red-800 border-red-300",
+        };
+        const lvText = levelEl.textContent;
+        levelEl.className = "text-xs font-semibold px-2.5 py-1 rounded-full border " +
+          (levelColors[lvText] || "bg-slate-100 text-slate-600 border-slate-200");
+        credBar.style.width = Math.min(100, cred) + "%";
+        credBar.className =
+          "metric-bar-fill " +
+          (cred >= 90 ? "bg-emerald-500" : cred >= 65 ? "bg-amber-500" : cred >= 40 ? "bg-orange-500" : "bg-red-500");
+      }
+
+      // 预测方法
+      const methodEl = document.getElementById("cred-method");
+      if (methodEl) {
+        const methodMap = {
+          "cost_structure_ratio": "成本结构公式（比例传导）",
+          "global_fallback": "传导系数模型（全局兜底）",
+        };
+        const m = j.预测方法 || "";
+        let mLabel = methodMap[m] || m;
+        if (m.startsWith("conduction_coeff(product_specific)")) mLabel = "传导系数模型（产品专属）";
+        else if (m.startsWith("conduction_coeff(product_limited)")) mLabel = "传导系数模型（样本有限）";
+        else if (m.startsWith("conduction_coeff(global_fallback)")) mLabel = "传导系数模型（全局兜底）";
+        methodEl.textContent = "预测方法：" + (mLabel || "—");
+      }
+
+      // 警告信息
+      const warningsEl = document.getElementById("cred-warnings");
+      if (warningsEl) {
+        const warns = [...new Set((j.预测警告 || []).filter(Boolean))];
+        if (warns.length === 0) {
+          warningsEl.innerHTML = "";
+        } else {
+          warningsEl.innerHTML = warns.map(w => {
+            const isCritical = w.startsWith("🚨");
+            const isHigh = isCritical || w.startsWith("⚠️");
+            const cls = isCritical
+              ? "text-red-800 bg-red-100 rounded px-2 py-1 border border-red-300"
+              : isHigh
+              ? "text-red-700 bg-red-50 rounded px-2 py-1 border border-red-200"
+              : "text-amber-700 bg-amber-50 rounded px-2 py-1 border border-amber-200";
+            return `<div class="${cls}">${esc(w)}</div>`;
+          }).join("");
+        }
+      }
+
+      document.getElementById("cred-desc").textContent = j.可信度说明 || "—";
+
+      // ── 敏感性分析（用户调价后）────────────────────────────────────────
+      const sensBody = document.getElementById("sensitivity-body");
+      const sensList = j.敏感性分析 || [];
+      if (sensBody) {
+        if (!sensList.length) {
+          sensBody.innerHTML =
+            '<p class="text-slate-400">修改组件单价并点击「计算预测产品价」后显示</p>';
+        } else {
+          sensBody.innerHTML = sensList
+            .map((s) => {
+              const name = esc(s["材料型号"] || s["材料编码"] || "");
+              const pLo = s["单价区间"]?.[0];
+              const pHi = s["单价区间"]?.[1];
+              const ppLo = s["产品价格_kg区间"]?.[0];
+              const ppHi = s["产品价格_kg区间"]?.[1];
+              const pct = s["产品价格变动_pct"];
+              return (
+                '<div class="border border-amber-100 rounded-lg p-2.5 bg-white/80">' +
+                '<div class="font-medium text-slate-800 mb-1">' + name + "</div>" +
+                "<p>若单价在 <span class=\"num font-medium\">" + fmt(pLo) + "～" + fmt(pHi) +
+                "</span>（±" + (s["单价波动_pct"] ?? 10) + "%），产品价格约 <span class=\"num font-medium\">" +
+                fmt(ppLo) + "～" + fmt(ppHi) + " 元/kg</span></p>" +
+                '<p class="text-amber-800 mt-1">产品价格变动幅度约 ±' + fmt(pct) + "%</p>" +
+                "</div>"
+              );
+            })
+            .join("");
+        }
+      }
+
+      // ── 模型历史误差（与调价无关）────────────────────────────────────
+      const me = j.模型历史误差 || {};
+      const rmseEl = document.getElementById("model-rmse");
+      const nEl = document.getElementById("model-n");
+      const loEl = document.getElementById("model-interval-lo");
+      const hiEl = document.getElementById("model-interval-hi");
+      const meDesc = document.getElementById("model-error-desc");
+      if (me.可用) {
+        if (rmseEl) rmseEl.textContent = fmt(me.MAE != null ? me.MAE : me.RMSE) + " 元/kg";
+        if (nEl) nEl.textContent = (me.样本数 != null ? me.样本数 : "—") + " 期";
+        const iv = me.预测区间_kg;
+        if (iv && iv.length === 2) {
+          if (loEl) loEl.textContent = fmt(iv[0]);
+          if (hiEl) hiEl.textContent = fmt(iv[1]);
+        }
+        const pt = j.预测产品价格_每公斤;
+        const compareEl = document.getElementById("model-error-compare");
+        if (meDesc) {
+          const maeVal = me.MAE != null ? me.MAE : me.RMSE;
+          const halfW = me.区间半宽 != null ? Number(me.区间半宽) : (maeVal != null ? 1.5 * Number(maeVal) : null);
+          const ivNote = me.区间口径 || "点估计 ± 1.5×MAE（稳健）";
+          let extra = "";
+          if (me.剔除异常月数 > 0) {
+            extra = "（已剔除 " + me.剔除异常月数 + " 个材料成本异常跳变月）";
+          }
+          let desc =
+            "历史 " + (me.样本数 || "—") + " 个月回测" + extra +
+            "：稳健 MAE ≈ " + fmt(maeVal) + " 元/kg" +
+            (halfW != null ? "（典型偏差量级；显示区间为当前预测 " + ivNote + "，半宽约 ±" + fmt(halfW) + " 元/kg）" : "") +
+            (pt != null ? "。当前点估计 " + fmt(pt) + " 元/kg。" : "。");
+          if (me["区间较窄说明"]) {
+            desc += " " + me["区间较窄说明"];
+          }
+          meDesc.textContent = desc;
+          if (compareEl && maeVal != null) {
+            compareEl.innerHTML =
+              "与左侧「敏感性分析」区间可能数值接近，但含义不同：本卡片表示<strong>不管你怎么调价</strong>，公式在历史上相对实际价的典型偏差约 <span class=\"num font-medium\">±" +
+              fmt(maeVal) + " 元/kg</span>（MAE）；上方区间为当前预测 <span class=\"num font-medium\">±" +
+              fmt(halfW != null ? halfW : 1.5 * maeVal) + " 元/kg</span>（1.5×MAE）。";
+          }
+        }
+      } else {
+        if (rmseEl) rmseEl.textContent = "—";
+        if (nEl) nEl.textContent = "—";
+        if (loEl) loEl.textContent = "—";
+        if (hiEl) hiEl.textContent = "—";
+        if (meDesc) meDesc.textContent = me.说明 || "历史样本不足，无法估计模型误差";
+      }
+    }
+
+    function quoteContextText(j) {
+      const parts = [];
+      if (j.报价月份 != null && j.报价月份 !== "") parts.push(`报价月份 ${j.报价月份}`);
+      const w = j.产品重量_kg != null ? j.产品重量_kg : j.重量;
+      if (w != null && w !== "") parts.push(`重量 ${w} kg`);
+      const listUnit = j.清单材料工费口径 || j.价格口径 || "元/KG";
+      const mc = j.材料成本;
+      const lf = j.工费;
+      if (mc != null && lf != null) parts.push(`材料 ${fmt(mc)} + 工费 ${fmt(lf)} ${listUnit}`);
+      const pkg = j.基准产品价格_每公斤;
+      const piece = j.基准产品价格;
+      if (pkg != null && piece != null) {
+        parts.push(`每公斤 ${fmt(pkg)} → 整件 ${fmt(piece)} 元/件`);
+      } else if (piece != null) {
+        parts.push(`整件 ${fmt(piece)} 元/件`);
+      }
+      return parts.length ? parts.join(" · ") : "（未匹配到报价月份/重量时仅按产品补全）";
+    }
+
+    function applyPredictionUI(j) {
+      const pred = j.预测产品价格;
+      const predKg = j.预测产品价格_每公斤;
+      const weight = j.产品重量_kg || j.重量;
+      let predText = "—";
+      if (predKg != null && predKg !== "") {
+        predText = fmt(predKg) + " 元/kg";
+        if (pred != null && weight != null && weight > 0) {
+          predText += "  （≈ " + fmt(pred) + " 元/件，" + fmt(weight) + " kg）";
+        }
+      } else if (pred != null && pred !== "") {
+        predText = fmt(pred) + " 元";
+      }
+      document.getElementById("v-pred-product").textContent = predText;
+
+      // 方法标签映射
+      const methodMap = {
+        "cost_structure_ratio": "成本结构公式（比例传导）",
+      };
+      const mRaw = j.预测方法 || "";
+      let mLabel = methodMap[mRaw] || mRaw;
+      if (mRaw.startsWith("conduction_coeff(product_specific)")) mLabel = "传导系数模型（产品专属）";
+      else if (mRaw.startsWith("conduction_coeff(product_limited)")) mLabel = "传导系数模型（样本有限）";
+      else if (mRaw.startsWith("conduction_coeff(global_fallback)")) mLabel = "传导系数模型（全局兜底）";
+      document.getElementById("v-pred-method").textContent = mLabel
+        ? `算法：${mLabel}`
+        : "—";
+
+      const base = j.基准产品价格 != null ? j.基准产品价格 : j.总成本;
+      refTotalCost = base != null && base !== "" ? Number(base) : null;
+      document.getElementById("v-prod-price").textContent =
+        refTotalCost != null && !Number.isNaN(refTotalCost) ? fmt(refTotalCost) : "—";
+      const qctx = document.getElementById("v-quote-context");
+      if (qctx) qctx.textContent = quoteContextText(j);
+
+      const diffEl = document.getElementById("v-pred-diff");
+      function formatPredDiff(j) {
+        const dPiece = j.差额_预测产品价;
+        const dKg = j.差额_预测产品价_每公斤;
+        const basePiece = j.基准产品价格;
+        const baseKg = j.基准产品价格_每公斤;
+        if (dPiece == null && dKg == null) return null;
+        const parts = [];
+        if (dPiece != null && !Number.isNaN(Number(dPiece))) {
+          const dp = Number(dPiece);
+          let s = (dp >= 0 ? "+" : "") + fmt(dp) + " 元/件";
+          if (basePiece != null) s += "（相对清单基准整件 " + fmt(basePiece) + " 元/件";
+          if (dKg != null && baseKg != null) {
+            const dk = Number(dKg);
+            s += "；每公斤 " + (dk >= 0 ? "+" : "") + fmt(dk) + " 元/kg，基准 " + fmt(baseKg) + " 元/kg";
+          }
+          s += "）";
+          parts.push(s);
+        } else if (dKg != null && baseKg != null) {
+          const dk = Number(dKg);
+          parts.push(
+            (dk >= 0 ? "+" : "") + fmt(dk) + " 元/kg（相对清单基准 " + fmt(baseKg) + " 元/kg）"
+          );
+        }
+        return parts[0] || null;
+      }
+      if (!j.用户已调价) {
+        diffEl.textContent = "";
+        diffEl.className = "hidden";
+      } else {
+        diffEl.className = "text-xs mt-1 num leading-snug";
+        const diffText = formatPredDiff(j);
+        if (diffText) {
+          const d = Number(j.差额_预测产品价 != null ? j.差额_预测产品价 : j.差额_预测产品价_每公斤);
+          diffEl.textContent = diffText;
+          diffEl.className += d > 0 ? " text-red-600" : d < 0 ? " text-emerald-600" : " text-slate-500";
+        } else if (pred != null && refTotalCost != null) {
+          const d = Number(pred) - refTotalCost;
+          diffEl.textContent = (d >= 0 ? "+" : "") + fmt(d) + " 元/件（相对清单基准整件 " + fmt(refTotalCost) + " 元/件）";
+          diffEl.className += d > 0 ? " text-red-600" : d < 0 ? " text-emerald-600" : " text-slate-500";
+        } else {
+          diffEl.textContent = "差额 —";
+          diffEl.className += " text-slate-500";
+        }
+      }
+
+      const simVal = j.模拟原材料总成本 != null ? j.模拟原材料总成本 : j.baseline原材料总成本;
+      document.getElementById("v-sim").textContent = fmt(simVal);
+      document.getElementById("v-orig").textContent = fmt(j.baseline原材料总成本);
+      setMetricsUI(j);
+    }
+
+    async function loadBom() {
+      showErr("");
+      currentProduct = document.getElementById("product-input").value.trim();
+      if (!currentProduct) {
+        showErr("请先输入或选择产品编码。");
+        return;
+      }
+      const res = await fetch(API("/api/bi/product_bom/{t}?") + new URLSearchParams({ product: currentProduct }));
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || res.statusText);
+
+      baselineTotal = j.baseline原材料总成本;
+      defaultPrices = {};
+      lineState = {};
+      const tb = document.getElementById("tbody");
+      tb.innerHTML = "";
+      document.getElementById("empty-hint").classList.add("hidden");
+      document.getElementById("summary").classList.remove("hidden");
+      applyPredictionUI(j);
+
+      for (const row of j.lines || []) {
+        const comp = String(row["组件编码"] ?? "");
+        const p0 = Number(row["组件单价"] ?? 0);
+        const lineCost = Number(row["行原材料成本"] ?? 0);
+        const pct = Number(row["成本占产品%"] ?? 0);
+        defaultPrices[comp] = p0;
+        lineState[comp] = { line: lineCost, pct };
+        const tr = document.createElement("tr");
+        tr.className = "border-t border-slate-100 hover:bg-slate-50";
+        tr.innerHTML = `
+          <td class="px-3 py-2 font-mono text-xs">${esc(comp)}</td>
+          <td class="px-3 py-2 max-w-[200px] truncate">${esc(row["组件名称"] ?? "")}</td>
+          <td class="px-3 py-2 text-right num">${fmt(row["MENGE合计"])}</td>
+          <td class="px-3 py-2 text-right num">${fmt(p0)}</td>
+          <td class="px-3 py-2 text-right">
+            <input type="number" step="any" data-comp="${esc(comp)}" class="price-inp w-28 border border-slate-300 rounded px-2 py-1 text-right num text-sm" value="${esc(p0)}" />
+          </td>
+          <td class="px-3 py-2 text-right num text-slate-600">${fmt(row["单价每变动1对总成本的边际"])}</td>
+          <td class="px-3 py-2 text-right num td-sim-pct">${fmt(pct)}</td>
+          <td class="px-3 py-2 text-right num td-sim-line">${fmt(lineCost)}</td>
+        `;
+        tb.appendChild(tr);
+      }
+    }
+
+    function collectPrices() {
+      const prices = {};
+      document.querySelectorAll(".price-inp").forEach((inp) => {
+        prices[inp.getAttribute("data-comp")] = Number(inp.value);
+      });
+      return prices;
+    }
+
+    async function simulate() {
+      showErr("");
+      const pid = document.getElementById("product-input").value.trim();
+      if (!pid || pid !== currentProduct) {
+        showErr("请先点击「加载 BOM」成功后再试。");
+        return;
+      }
+      const res = await fetch(API("/api/bi/product_cost_simulate/{t}"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ product: currentProduct, prices: collectPrices() }),
+      });
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || res.statusText);
+
+      applyPredictionUI(j);
+
+      const byComp = {};
+      (j.lines || []).forEach((ln) => {
+        byComp[String(ln["组件编码"] ?? "")] = ln;
+      });
+      document.querySelectorAll("#tbody tr").forEach((tr) => {
+        const inp = tr.querySelector(".price-inp");
+        if (!inp) return;
+        const ln = byComp[inp.getAttribute("data-comp")];
+        if (!ln) return;
+        const tdLine = tr.querySelector(".td-sim-line");
+        const tdPct = tr.querySelector(".td-sim-pct");
+        if (tdLine) tdLine.textContent = fmt(ln["模拟行成本"]);
+        if (tdPct) tdPct.textContent = fmt(ln["成本占产品%"]);
+      });
+    }
+
+    function resetPrices() {
+      document.querySelectorAll(".price-inp").forEach((inp) => {
+        const comp = inp.getAttribute("data-comp");
+        if (comp in defaultPrices) inp.value = String(defaultPrices[comp]);
+      });
+      simulate().catch((e) => showErr(e.message));
+    }
+
+    const productInput = document.getElementById("product-input");
+    const productSuggest = document.getElementById("product-suggest");
+    productInput.addEventListener("input", () => { showErr(""); scheduleSuggestUpdate(); });
+    productInput.addEventListener("focus", scheduleSuggestUpdate);
+    productInput.addEventListener("keydown", (e) => { if (e.key === "Escape") hideSuggest(); });
+    productSuggest.addEventListener("mousedown", (e) => e.preventDefault());
+    document.addEventListener("click", (e) => {
+      if (!productInput.contains(e.target) && !productSuggest.contains(e.target)) hideSuggest();
+    });
+
+    document.getElementById("btn-load").addEventListener("click", () => loadBom().catch((e) => showErr(e.message)));
+    document.getElementById("btn-sim").addEventListener("click", () => simulate().catch((e) => showErr(e.message)));
+    document.getElementById("btn-reset").addEventListener("click", resetPrices);
+
+    loadProductsMeta().catch((e) => showErr(e.message));
+  </script>
+</body>
+</html>

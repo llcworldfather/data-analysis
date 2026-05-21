@@ -1,0 +1,1673 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>组件使用分析 · BI 看板</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root { --blue: #2563EB; --blue-light: #EFF6FF; }
+    * { box-sizing: border-box; }
+    body { font-family: 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+
+    /* Spinner */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner { animation: spin .75s linear infinite; }
+
+    /* Fade in */
+    .fade-in { animation: fadeIn .3s ease-out both; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+    /* Table head sticky */
+    #main-thead th { position: sticky; top: 0; z-index: 2; }
+    #detail-thead th { position: sticky; top: 0; z-index: 2; }
+
+    /* No wrap cells */
+    .nowrap { white-space: nowrap; }
+
+    /* Sortable column header */
+    .sort-btn { cursor: pointer; user-select: none; }
+    .sort-btn:hover { color: #2563EB; }
+
+    /* Clickable count badge */
+    .count-badge {
+      display: inline-flex; align-items: center; justify-content: center;
+      min-width: 2.2rem; padding: 0.2rem 0.6rem;
+      background: #EFF6FF; color: #1D4ED8; border: 1px solid #BFDBFE;
+      border-radius: 9999px; font-weight: 600; font-size: 0.8125rem;
+      cursor: pointer; transition: background .15s, box-shadow .15s;
+    }
+    .count-badge:hover {
+      background: #DBEAFE; box-shadow: 0 0 0 3px rgba(37,99,235,.15);
+    }
+
+    /* Progress bar */
+    .pct-bar-bg { background: #F1F5F9; border-radius: 4px; height: 6px; overflow: hidden; }
+    .pct-bar-fill { background: #2563EB; height: 100%; border-radius: 4px; transition: width .3s; }
+
+    /* Modal overlay */
+    #detail-modal { backdrop-filter: blur(4px); }
+
+    /* Row hover */
+    .trow:hover td { background: #F8FAFC !important; }
+
+    /* Toast */
+    @keyframes t-in  { from { transform: translateX(110%); opacity: 0 } to { transform: none; opacity: 1 } }
+    @keyframes t-out { from { transform: none; opacity: 1 } to { transform: translateX(110%); opacity: 0 } }
+    .t-in  { animation: t-in  .3s ease-out both; }
+    .t-out { animation: t-out .3s ease-in  both; }
+
+    /* Scrollbar thin */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 3px; }
+
+    /* Tab buttons */
+    .tab-btn {
+      padding: 0.4rem 1.1rem; border-radius: 0.5rem; font-size: 0.8125rem; font-weight: 500;
+      color: #64748B; border: none; background: transparent; cursor: pointer;
+      transition: background .15s, color .15s; white-space: nowrap;
+    }
+    .tab-btn:hover { background: #E2E8F0; color: #1E293B; }
+    .tab-btn.active { background: #fff; color: #4F46E5; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+
+    /* Price change badges */
+    .badge-up   { background: #FEF2F2; color: #B91C1C; border: 1px solid #FECACA; }
+    .badge-down { background: #F0FDF4; color: #15803D; border: 1px solid #BBF7D0; }
+    .badge-flat { background: #F8FAFC; color: #64748B; border: 1px solid #E2E8F0; }
+
+    /* Impact level badges */
+    .level-high { background: #FEF2F2; color: #B91C1C; }
+    .level-mid  { background: #FFFBEB; color: #B45309; }
+    .level-low  { background: #F0FDF4; color: #15803D; }
+
+    /* Row highlight (jump-to) */
+    @keyframes pf-hl {
+      0%,15% { background-color: #BFDBFE; }
+      100%   { background-color: transparent; }
+    }
+    .pf-highlight { animation: pf-hl 3.5s ease-out forwards; }
+
+    /* Clickable jump cells */
+    .jump-cell {
+      cursor: pointer; text-decoration: underline dotted;
+      transition: color .15s;
+    }
+    .jump-cell:hover { color: #2563EB !important; }
+
+    /* Markdown output for AI advice */
+    .md-content h2 { font-size: 1rem; font-weight: 700; color: #92400E; margin: 0.75rem 0 0.35rem; }
+    .md-content h3 { font-size: 0.92rem; font-weight: 700; color: #334155; margin: 0.65rem 0 0.3rem; }
+    .md-content p { margin: 0.35rem 0; }
+    .md-content ul { list-style: disc; padding-left: 1.25rem; margin: 0.35rem 0; }
+    .md-content li { margin: 0.25rem 0; }
+    .md-content strong { color: #0F172A; font-weight: 700; }
+    .md-content code { background: #FEF3C7; color: #92400E; padding: 0.05rem 0.25rem; border-radius: 0.25rem; }
+    .md-content .md-table-wrap { overflow-x: auto; margin: 0.55rem 0 0.9rem; border: 1px solid #E2E8F0; border-radius: 0.6rem; }
+    .md-content table { width: 100%; border-collapse: collapse; min-width: 720px; background: #fff; }
+    .md-content th { background: #FFFBEB; color: #92400E; font-weight: 700; }
+    .md-content th, .md-content td { border-bottom: 1px solid #E2E8F0; padding: 0.55rem 0.7rem; text-align: left; vertical-align: top; white-space: normal; }
+    .md-content tr:last-child td { border-bottom: none; }
+  </style>
+</head>
+<body class="bg-slate-50 min-h-screen text-slate-800">
+
+<!-- ═══════════ NAV ═══════════ -->
+<nav class="bg-white/90 backdrop-blur border-b border-slate-200 sticky top-0 z-40">
+  <div class="max-w-7xl mx-auto px-4 sm:px-6 flex items-center justify-between h-14">
+    <div class="flex items-center gap-3">
+      <a href="/sim/{{ token }}" class="text-sm text-indigo-600 hover:text-indigo-800 font-medium">成本模拟</a>
+      <span class="text-slate-200">|</span>
+      <a href="/" class="flex items-center gap-1.5 text-slate-500 hover:text-slate-800 transition-colors text-sm">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+        </svg>
+        返回首页
+      </a>
+      <span class="text-slate-200">|</span>
+      <div class="flex items-center gap-2">
+        <div class="w-6 h-6 bg-indigo-600 rounded-md flex items-center justify-center flex-shrink-0">
+          <svg class="w-3.5 h-3.5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2"
+              d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0
+                 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0
+                 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+          </svg>
+        </div>
+        <span class="font-semibold text-sm">组件使用分析</span>
+        <span class="hidden sm:inline text-slate-400 text-xs font-normal">· BI 看板</span>
+      </div>
+    </div>
+    <!-- Right side: stats + export button -->
+    <div class="flex items-center gap-3">
+      <div id="nav-stats" class="hidden sm:flex items-center gap-4 text-xs text-slate-500">
+        <span>共 <strong id="nav-total" class="text-slate-700">—</strong> 个组件</span>
+        <span>涉及 <strong id="nav-products" class="text-slate-700">—</strong> 个产品</span>
+      </div>
+      <a id="export-btn" href="/api/download/{{ token }}"
+         class="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white text-xs font-semibold px-3.5 py-2 rounded-lg transition-colors flex-shrink-0">
+        <!-- 下载图标（就绪时显示） -->
+        <svg id="export-icon" class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+        </svg>
+        <!-- 加载动画（准备中时显示） -->
+        <svg id="export-spinner" class="w-3.5 h-3.5 hidden spinner" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="9" stroke-width="2.5" stroke-dasharray="28 56" stroke-linecap="round"/>
+        </svg>
+        <span id="export-label">导出 Excel</span>
+      </a>
+    </div>
+  </div>
+</nav>
+
+<!-- ═══════════ LOADING ═══════════ -->
+<div id="loading-state" class="flex flex-col items-center justify-center py-28 text-slate-400">
+  <div class="w-10 h-10 border-2 border-indigo-600 border-t-transparent rounded-full spinner mb-4"></div>
+  <p class="text-sm font-medium text-slate-500">正在加载数据…</p>
+</div>
+
+<!-- ═══════════ ERROR STATE ═══════════ -->
+<div id="error-state" class="hidden max-w-xl mx-auto mt-16 px-4">
+  <div class="bg-red-50 border border-red-200 rounded-2xl p-6 text-center">
+    <div class="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-3">
+      <svg class="w-5 h-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+          d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+      </svg>
+    </div>
+    <p class="text-red-800 font-semibold mb-1">加载失败</p>
+    <p id="error-msg" class="text-red-600 text-sm"></p>
+    <a href="/" class="mt-4 inline-block text-sm text-red-700 underline">← 返回首页重新分析</a>
+  </div>
+</div>
+
+<!-- ═══════════ MAIN CONTENT ═══════════ -->
+<div id="main-content" class="hidden max-w-7xl mx-auto px-4 sm:px-6 py-6 fade-in">
+
+  <!-- ── Tab Bar ── -->
+  <div class="flex gap-1 mb-5 bg-slate-100 rounded-xl p-1 w-fit">
+    <button id="tab-btn-cost"  onclick="switchTab('cost')"  class="tab-btn active">组件成本分析</button>
+    <button id="tab-btn-price" onclick="switchTab('price')" class="tab-btn">价格波动分析</button>
+  </div>
+
+  <!-- ══════════ Tab: 组件成本分析 ══════════ -->
+  <div id="tab-cost-content">
+
+  <!-- ── KPI Cards ── -->
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+    <div class="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+      <p class="text-xs text-slate-400 mb-1">组件总数</p>
+      <p class="text-2xl font-bold text-slate-800" id="kpi-total">—</p>
+    </div>
+    <div class="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+      <p class="text-xs text-slate-400 mb-1">当前显示</p>
+      <p class="text-2xl font-bold text-indigo-600" id="kpi-shown">—</p>
+    </div>
+    <div class="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+      <p class="text-xs text-slate-400 mb-1">最大涉及产品数</p>
+      <p class="text-2xl font-bold text-slate-800" id="kpi-max-prod">—</p>
+    </div>
+    <div class="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+      <p class="text-xs text-slate-400 mb-1">全局总成本</p>
+      <p class="text-2xl font-bold text-slate-800" id="kpi-total-cost">—</p>
+    </div>
+  </div>
+
+  <!-- ── Filter Bar ── -->
+  <div class="bg-white rounded-xl border border-slate-200 shadow-sm p-4 mb-4 flex flex-wrap items-end gap-3">
+    <!-- Search -->
+    <div class="flex-1 min-w-[180px]">
+      <label class="block text-xs font-medium text-slate-500 mb-1.5">组件编码搜索</label>
+      <div class="relative">
+        <svg class="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+             fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+        </svg>
+        <input id="search-input" type="text" placeholder="输入组件编码关键字…"
+               oninput="applyFilters()"
+               class="w-full pl-9 pr-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 transition" />
+      </div>
+    </div>
+
+    <!-- Min products -->
+    <div class="min-w-[160px]">
+      <label class="block text-xs font-medium text-slate-500 mb-1.5">最少涉及产品数 ≥</label>
+      <input id="min-prod-filter" type="number" min="0" placeholder="0"
+             oninput="applyFilters()"
+             class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 transition" />
+    </div>
+
+    <!-- Pct filter -->
+    <div class="min-w-[220px]">
+      <label class="block text-xs font-medium text-slate-500 mb-1.5">
+        平均用量占比% ≥
+        <span id="pct-range-hint" class="text-slate-300 font-normal ml-1"></span>
+      </label>
+      <div class="flex items-center gap-2">
+        <input id="pct-filter" type="number" min="0" max="100" step="0.1" placeholder="例：80"
+               oninput="applyFilters()"
+               class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 transition" />
+        <span class="text-slate-400 text-sm flex-shrink-0">%</span>
+      </div>
+    </div>
+
+    <!-- Global cost contribution filter -->
+    <div class="min-w-[200px]">
+      <label class="block text-xs font-medium text-slate-500 mb-1.5">
+        全局总成本贡献 ≥
+        <span id="cost-range-hint" class="text-slate-300 font-normal ml-1"></span>
+      </label>
+      <input id="cost-filter" type="number" min="0" step="any" placeholder="例：10000"
+             oninput="applyFilters()"
+             class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 transition" />
+    </div>
+
+    <!-- Global cost pct filter -->
+    <div class="min-w-[220px]">
+      <label class="block text-xs font-medium text-slate-500 mb-1.5">
+        全局成本占比% ≥
+        <span id="cost-pct-range-hint" class="text-slate-300 font-normal ml-1"></span>
+      </label>
+      <div class="flex items-center gap-2">
+        <input id="cost-pct-filter" type="number" min="0" max="100" step="0.01" placeholder="例：1"
+               oninput="applyFilters()"
+               class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 transition" />
+        <span class="text-slate-400 text-sm flex-shrink-0">%</span>
+      </div>
+    </div>
+
+    <!-- Reset -->
+    <button onclick="resetFilters()"
+            class="px-4 py-2 text-sm text-slate-500 border border-slate-200 rounded-lg hover:bg-slate-50 hover:text-slate-700 transition flex-shrink-0">
+      重置
+    </button>
+  </div>
+
+  <!-- Filter result hint -->
+  <p id="filter-hint" class="hidden text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-4 py-2 mb-3">
+    筛选中
+  </p>
+
+  <!-- ── Main Table ── -->
+  <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+    <div class="overflow-x-auto" style="max-height: calc(100vh - 340px); overflow-y: auto;">
+      <table class="w-full text-sm text-left">
+        <thead id="main-thead" class="bg-slate-50 text-slate-500 text-xs font-semibold border-b border-slate-200">
+          <tr>
+            <th class="px-4 py-3 nowrap">组件编码</th>
+            <th class="px-4 py-3 nowrap text-center sort-btn" onclick="sortBy('涉及产品数')" title="点击排序">
+              涉及产品数
+              <span id="sort-icon-涉及产品数" class="ml-1 opacity-40">↕</span>
+            </th>
+            <th class="px-4 py-3 nowrap sort-btn" onclick="sortBy('全局总成本贡献')" title="点击排序">
+              全局总成本贡献
+              <span id="sort-icon-全局总成本贡献" class="ml-1 opacity-40">↕</span>
+            </th>
+            <th class="px-4 py-3 nowrap sort-btn" onclick="sortBy('全局总用量')" title="点击排序">
+              全局总用量
+              <span id="sort-icon-全局总用量" class="ml-1 opacity-40">↕</span>
+            </th>
+            <th class="px-4 py-3 nowrap sort-btn" onclick="sortBy('平均用量占比%（在各产品中）')" title="点击排序">
+              平均用量占比%
+              <span id="sort-icon-平均用量占比%（在各产品中）" class="ml-1 opacity-40">↕</span>
+            </th>
+            <th class="px-4 py-3 nowrap sort-btn min-w-[160px]" onclick="sortBy('全局成本占比%')" title="点击排序">
+              全局成本占比%
+              <span id="sort-icon-全局成本占比%" class="ml-1 opacity-40">↕</span>
+            </th>
+          </tr>
+        </thead>
+        <tbody id="main-tbody" class="divide-y divide-slate-100 text-slate-700">
+          <!-- Populated by JS -->
+        </tbody>
+      </table>
+    </div>
+    <!-- Empty state -->
+    <div id="table-empty" class="hidden text-center py-14 text-slate-400">
+      <svg class="w-10 h-10 mx-auto mb-3 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+          d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+      </svg>
+      <p class="text-sm">没有符合筛选条件的组件</p>
+      <button onclick="resetFilters()" class="mt-2 text-xs text-indigo-500 hover:underline">清除筛选</button>
+    </div>
+    <!-- Table footer -->
+    <div id="table-footer" class="px-4 py-2.5 border-t border-slate-100 text-xs text-slate-400 flex justify-between items-center">
+      <span>点击「涉及产品数」蓝色标签查看详情 · 点击列头排序</span>
+      <span id="footer-count">共 0 行</span>
+    </div>
+  </div>
+
+  </div><!-- /tab-cost-content -->
+
+  <!-- ══════════ Tab: 价格波动分析 ══════════ -->
+  <div id="tab-price-content" class="hidden">
+
+    <!-- ── 查询筛选栏 ── -->
+    <div class="bg-white rounded-xl border border-slate-200 shadow-sm p-4 mb-4">
+      <p class="text-xs font-semibold text-slate-500 mb-3 uppercase tracking-wide">日期区间 & 筛选</p>
+      <div class="flex flex-wrap items-end gap-3">
+
+        <div class="min-w-[160px]">
+          <label class="block text-xs font-medium text-slate-500 mb-1.5">开始日期</label>
+          <input id="pf-start-date" type="date"
+                 class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 transition" />
+        </div>
+
+        <div class="min-w-[160px]">
+          <label class="block text-xs font-medium text-slate-500 mb-1.5">结束日期</label>
+          <input id="pf-end-date" type="date"
+                 class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 transition" />
+        </div>
+
+        <div class="min-w-[200px]">
+          <label class="block text-xs font-medium text-slate-500 mb-1.5">价格变动幅度 ≥（绝对值）</label>
+          <div class="flex items-center gap-2">
+            <input id="pf-min-pct" type="number" min="0" max="999" step="0.1" placeholder="例：5"
+                   class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400 transition" />
+            <span class="text-slate-400 text-sm flex-shrink-0">%</span>
+          </div>
+        </div>
+
+        <button onclick="queryPriceFluctuation()"
+                class="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors flex-shrink-0">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+          </svg>
+          查询波动
+        </button>
+
+        <button onclick="resetPriceFilter()"
+                class="px-4 py-2 text-sm text-slate-500 border border-slate-200 rounded-lg hover:bg-slate-50 transition flex-shrink-0">
+          重置
+        </button>
+
+        <button onclick="queryAiPurchaseAdvice()"
+                class="flex items-center gap-1.5 bg-amber-500 hover:bg-amber-600 active:bg-amber-700 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors flex-shrink-0">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M13 10V3L4 14h7v7l9-11h-7z"/>
+          </svg>
+          AI 采购建议（近三个月）
+        </button>
+      </div>
+    </div>
+
+    <!-- ── AI 采购建议 ── -->
+    <div id="ai-advice-loading" class="hidden bg-white rounded-xl border border-amber-200 shadow-sm p-5 mb-4">
+      <div class="flex items-center text-amber-700">
+        <div class="w-7 h-7 border-2 border-amber-500 border-t-transparent rounded-full spinner mr-3"></div>
+        <span class="text-sm font-semibold">正在调用 DeepSeek 生成采购建议…</span>
+      </div>
+      <p class="text-xs text-slate-400 mt-2">系统会读取 MAKTX 物料名称，并基于最近三个月的本地价格波动生成建议。</p>
+    </div>
+
+    <div id="ai-advice-panel" class="hidden bg-white rounded-xl border border-amber-200 shadow-sm overflow-hidden mb-4">
+      <div class="px-4 py-3 border-b border-amber-100 bg-amber-50 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p class="font-semibold text-sm text-amber-900">DeepSeek AI 采购建议</p>
+          <p id="ai-advice-range" class="text-xs text-amber-700 mt-0.5">—</p>
+        </div>
+        <span id="ai-advice-total" class="text-xs text-amber-700 bg-white/70 px-2 py-1 rounded-full">—</span>
+      </div>
+      <div class="p-4">
+        <div id="ai-advice-text" class="md-content text-sm text-slate-700 leading-7"></div>
+        <div id="ai-materials-preview" class="mt-4 hidden">
+          <p class="text-xs font-semibold text-slate-500 mb-2">提交给 DeepSeek 的物料清单（Excel 仅用于提取 MAKTX）</p>
+          <div class="overflow-x-auto border border-slate-100 rounded-lg">
+            <table class="w-full text-xs text-left">
+              <thead class="bg-slate-50 text-slate-500">
+                <tr>
+                  <th class="px-3 py-2 nowrap">物料名称</th>
+                  <th class="px-3 py-2 nowrap">组件编码</th>
+                  <th class="px-3 py-2 text-right nowrap">涉及产品</th>
+                  <th class="px-3 py-2 text-right nowrap">Excel记录数</th>
+                </tr>
+              </thead>
+              <tbody id="ai-materials-tbody" class="divide-y divide-slate-100"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── 加载中 ── -->
+    <div id="pf-loading" class="hidden flex items-center justify-center py-14 text-slate-400">
+      <div class="w-8 h-8 border-2 border-indigo-600 border-t-transparent rounded-full spinner mr-3"></div>
+      <span class="text-sm font-medium">正在计算价格波动…</span>
+    </div>
+
+    <!-- ── 初始提示 ── -->
+    <div id="pf-init-hint" class="flex flex-col items-center justify-center py-16 text-slate-400">
+      <svg class="w-12 h-12 mb-3 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+          d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+      </svg>
+      <p class="text-sm">请选择日期区间后点击「查询波动」</p>
+      <p class="text-xs mt-1 text-slate-300">数据来源：原始 Excel 的 CREATEDATE 与 ZDJ（组件单价）字段</p>
+    </div>
+
+    <!-- ── 结果区 ── -->
+    <div id="pf-results" class="hidden">
+
+      <!-- KPI 小卡片 -->
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+        <div class="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <p class="text-xs text-slate-400 mb-1">波动组件数</p>
+          <p class="text-2xl font-bold text-slate-800" id="pf-kpi-total">—</p>
+        </div>
+        <div class="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <p class="text-xs text-slate-400 mb-1">最大涨幅组件</p>
+          <p class="text-lg font-bold text-red-600 truncate" id="pf-kpi-max-up">—</p>
+        </div>
+        <div class="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <p class="text-xs text-slate-400 mb-1">最大跌幅组件</p>
+          <p class="text-lg font-bold text-green-600 truncate" id="pf-kpi-max-down">—</p>
+        </div>
+        <div class="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <p class="text-xs text-slate-400 mb-1">查询区间</p>
+          <p class="text-sm font-semibold text-slate-700" id="pf-kpi-range">—</p>
+        </div>
+      </div>
+
+      <!-- 组件价格波动明细表 -->
+      <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden mb-4">
+        <div class="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
+          <span class="font-semibold text-sm text-slate-700">组件价格波动明细</span>
+          <span class="text-xs text-slate-400">按价格差值绝对值降序</span>
+        </div>
+        <div class="overflow-x-auto" style="max-height: calc(100vh - 480px); overflow-y: auto;">
+          <table class="w-full text-sm text-left">
+            <thead id="pf-thead" class="bg-slate-50 text-slate-500 text-xs font-semibold border-b border-slate-200 sticky top-0">
+              <tr>
+                <th class="px-4 py-3 nowrap">#</th>
+                <th class="px-4 py-3 nowrap">组件编码</th>
+                <th id="pf-th-name" class="px-4 py-3 nowrap hidden">组件名称</th>
+                <th id="pf-th-cat"  class="px-4 py-3 nowrap hidden">分类</th>
+                <th class="px-4 py-3 nowrap text-right">期初价格</th>
+                <th class="px-4 py-3 nowrap text-right">期末价格</th>
+                <th class="px-4 py-3 nowrap text-right sort-btn" onclick="pfSortBy('价格差值')" title="点击排序">
+                  价格差值 <span id="pf-sort-icon-价格差值" class="ml-0.5 text-indigo-500">↓</span>
+                </th>
+                <th class="px-4 py-3 nowrap text-right min-w-[110px] sort-btn" onclick="pfSortBy('价格变动%')" title="点击排序">
+                  价格变动% <span id="pf-sort-icon-价格变动%" class="ml-0.5 opacity-30">↕</span>
+                </th>
+                <th class="px-4 py-3 nowrap text-right">期间最低价</th>
+                <th class="px-4 py-3 nowrap text-right">期间最高价</th>
+                <th class="px-4 py-3 nowrap text-center">涉及产品</th>
+              </tr>
+            </thead>
+            <tbody id="pf-tbody" class="divide-y divide-slate-100 text-slate-700"></tbody>
+          </table>
+        </div>
+        <div id="pf-table-empty" class="hidden text-center py-12 text-slate-400">
+          <svg class="w-10 h-10 mx-auto mb-3 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+              d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10"/>
+          </svg>
+          <p class="text-sm">该区间内无价格变动数据</p>
+        </div>
+        <div id="pf-footer" class="px-4 py-2.5 border-t border-slate-100 text-xs text-slate-400 flex justify-between">
+          <span>期初 = 区间内最早记录价，期末 = 最晚记录价 · 点击「价格差值」「价格变动%」列头可切换升降序</span>
+          <span id="pf-footer-count">共 0 行</span>
+        </div>
+      </div>
+
+      <!-- 分类影响汇总 -->
+      <div id="pf-cat-section" class="hidden mb-4">
+        <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+          <div class="px-4 py-3 border-b border-slate-100 flex flex-wrap items-center gap-3 justify-between">
+            <span class="font-semibold text-sm text-slate-700">分类价格波动影响汇总</span>
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="text-xs text-slate-400">影响等级阈值：高 ≥</span>
+              <input id="pf-level-high" type="number" value="10" min="0" step="1"
+                     oninput="recomputeImpactLevels()"
+                     class="w-14 px-2 py-1 border border-slate-200 rounded text-xs text-center focus:outline-none focus:ring-1 focus:ring-indigo-300 transition" />
+              <span class="text-xs text-slate-400">% / 中 ≥</span>
+              <input id="pf-level-mid" type="number" value="3" min="0" step="1"
+                     oninput="recomputeImpactLevels()"
+                     class="w-14 px-2 py-1 border border-slate-200 rounded text-xs text-center focus:outline-none focus:ring-1 focus:ring-indigo-300 transition" />
+              <span class="text-xs text-slate-400">%（基于平均变动%绝对值）· 点击涨/跌幅可定位组件</span>
+            </div>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm text-left">
+              <thead class="bg-slate-50 text-slate-500 text-xs font-semibold border-b border-slate-200">
+                <tr>
+                  <th class="px-4 py-3 nowrap">分类</th>
+                  <th class="px-4 py-3 nowrap text-right">涉及组件数</th>
+                  <th class="px-4 py-3 nowrap text-right">平均变动%</th>
+                  <th class="px-4 py-3 nowrap text-right">最大涨幅%</th>
+                  <th class="px-4 py-3 nowrap text-right">最大跌幅%</th>
+                  <th class="px-4 py-3 nowrap text-right">上涨 / 下跌</th>
+                  <th class="px-4 py-3 nowrap text-center">影响等级</th>
+                </tr>
+              </thead>
+              <tbody id="pf-cat-tbody" class="divide-y divide-slate-100 text-slate-700"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- 建议区 -->
+      <div id="pf-advice" class="hidden bg-amber-50 border border-amber-200 rounded-xl p-4 mb-4">
+        <div class="flex gap-3 items-start">
+          <div class="flex-shrink-0 w-7 h-7 bg-amber-100 rounded-full flex items-center justify-center mt-0.5">
+            <svg class="w-4 h-4 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+            </svg>
+          </div>
+          <div>
+            <p class="font-semibold text-amber-800 text-sm mb-1">采购风险提示</p>
+            <div id="pf-advice-text" class="text-amber-700 text-sm space-y-1"></div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /pf-results -->
+  </div><!-- /tab-price-content -->
+
+</div><!-- /main-content -->
+
+
+<!-- ═══════════ DETAIL MODAL ═══════════ -->
+<div id="detail-modal"
+     class="fixed inset-0 z-50 hidden flex items-center justify-center bg-slate-900/50 px-4 py-6">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] flex flex-col fade-in">
+
+    <!-- Modal header -->
+    <div class="flex items-start justify-between px-6 py-4 border-b border-slate-100 flex-shrink-0">
+      <div>
+        <div class="flex items-center gap-2 mb-0.5">
+          <div class="w-5 h-5 bg-indigo-100 rounded flex items-center justify-center">
+            <svg class="w-3 h-3 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+          </div>
+          <h3 class="font-semibold text-slate-800 text-sm">组件使用详情</h3>
+        </div>
+        <p class="text-lg font-bold text-indigo-700 font-mono" id="modal-component-code">—</p>
+        <p class="text-xs text-slate-400 mt-0.5" id="modal-component-name"></p>
+      </div>
+      <button onclick="closeDetail()"
+              class="text-slate-400 hover:text-slate-600 transition-colors flex-shrink-0 mt-1">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Modal filter bar -->
+    <div class="px-6 py-3 border-b border-slate-100 flex flex-wrap items-center gap-3 flex-shrink-0 bg-slate-50/60">
+      <div class="flex items-center gap-2 text-xs text-slate-500">
+        <span id="modal-count-info" class="font-medium text-slate-700"></span>
+        <span>个产品使用此组件</span>
+      </div>
+      <div class="flex-1"></div>
+      <!-- Percentage filter for detail -->
+      <div class="flex items-center gap-2">
+        <label class="text-xs text-slate-500 nowrap">用量占比% ≥</label>
+        <input id="detail-pct-filter" type="number" min="0" max="100" step="0.1" placeholder="0"
+               oninput="applyDetailFilter()"
+               class="w-20 px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-indigo-300 transition" />
+        <span class="text-slate-400 text-xs">%</span>
+      </div>
+      <button onclick="resetDetailFilter()" class="text-xs text-slate-400 hover:text-slate-600 transition px-2 py-1.5 border border-slate-200 rounded-lg bg-white hover:bg-slate-50">
+        重置
+      </button>
+    </div>
+
+    <!-- Modal table -->
+    <div class="overflow-auto flex-1 px-0">
+      <div id="detail-loading" class="hidden flex items-center justify-center py-10">
+        <div class="w-7 h-7 border-2 border-indigo-600 border-t-transparent rounded-full spinner"></div>
+      </div>
+      <table class="w-full text-sm text-left">
+        <thead id="detail-thead" class="bg-slate-50 text-slate-500 text-xs font-semibold border-b border-slate-200 sticky top-0">
+          <tr>
+            <th class="px-4 py-3 nowrap">产品编码</th>
+            <th id="dth-name" class="px-4 py-3 nowrap hidden">组件名称</th>
+            <th id="dth-unit" class="px-4 py-3 nowrap hidden">计量单位</th>
+            <th class="px-4 py-3 nowrap">MENGE合计 ↓</th>
+            <th class="px-4 py-3 nowrap">用量占比%</th>
+            <th class="px-4 py-3 nowrap">行原材料成本</th>
+            <th class="px-4 py-3 nowrap">组件单价</th>
+          </tr>
+        </thead>
+        <tbody id="detail-tbody" class="divide-y divide-slate-100 text-slate-700">
+        </tbody>
+      </table>
+      <div id="detail-empty" class="hidden text-center py-10 text-slate-400 text-sm">
+        没有符合条件的记录
+      </div>
+    </div>
+
+    <!-- Modal footer -->
+    <div class="px-6 py-3 border-t border-slate-100 flex justify-between items-center flex-shrink-0 text-xs text-slate-400">
+      <span>已按 MENGE合计 从大到小排列</span>
+      <span id="detail-footer-count">—</span>
+    </div>
+  </div>
+</div>
+
+<!-- Toast Container -->
+<div id="toast-wrap" class="fixed top-4 right-4 z-50 flex flex-col gap-2 pointer-events-none"></div>
+
+<!-- ═══════════ SCRIPT ═══════════ -->
+<script>
+const TOKEN = "{{ token }}";
+
+/* ── State ── */
+let allData       = [];   // full dataset from /api/bi/summary
+let filteredData  = [];   // after main filters
+let sortCol       = "全局总成本贡献";
+let sortAsc       = false;
+let detailRaw     = [];   // full detail from /api/bi/detail
+let detailFiltered = [];  // after detail filter
+let hasName       = false;
+let hasUnit       = false;
+let maxPct        = 0;
+
+/* ── Init ── */
+window.addEventListener('DOMContentLoaded', () => {
+  loadData();
+
+  // 事件委托：点击任意 .count-badge 按钮时读取 data-comp 属性打开详情
+  // 避免 inline onclick 中因双引号冲突导致的 SyntaxError
+  document.getElementById('main-tbody').addEventListener('click', function(e) {
+    const btn = e.target.closest('.count-badge');
+    if (btn) showDetail(btn.dataset.comp);
+  });
+
+  document.getElementById('detail-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeDetail();
+  });
+});
+
+/* ── Load main data ── */
+async function loadData() {
+  try {
+    const res  = await fetch(`/api/bi/summary/${TOKEN}`);
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || '加载失败');
+
+    allData = json.data || [];
+
+    // Find max pct for bar scaling
+    maxPct = Math.max(...allData.map(r => +(r['全局成本占比%'] || 0)), 0.001);
+
+    // KPI
+    const totalCost = allData.reduce((s, r) => s + (r['全局总成本贡献'] || 0), 0);
+    const maxProd   = Math.max(...allData.map(r => +(r['涉及产品数'] || 0)), 0);
+    document.getElementById('kpi-total').textContent    = fmt(allData.length);
+    document.getElementById('kpi-max-prod').textContent = fmt(maxProd);
+    document.getElementById('kpi-total-cost').textContent = fmtCost(totalCost);
+    document.getElementById('nav-total').textContent    = fmt(allData.length);
+
+    // Estimate distinct products
+    const maxProdVal = Math.max(...allData.map(r => +(r['涉及产品数'] || 0)), 0);
+    document.getElementById('nav-products').textContent = maxProdVal > 0 ? `≥${maxProdVal}` : '—';
+
+    // Range hint: 平均用量占比%
+    const avgPctVals = allData.map(r => +(r['平均用量占比%（在各产品中）'] || 0)).filter(v => v > 0);
+    if (avgPctVals.length) {
+      const minV = Math.min(...avgPctVals).toFixed(1);
+      const maxV = Math.max(...avgPctVals).toFixed(1);
+      document.getElementById('pct-range-hint').textContent = `(${minV}%–${maxV}%)`;
+    }
+    // Range hint: 全局总成本贡献
+    const costVals = allData.map(r => +(r['全局总成本贡献'] || 0)).filter(v => v > 0);
+    if (costVals.length) {
+      const minC = Math.min(...costVals);
+      const maxC = Math.max(...costVals);
+      document.getElementById('cost-range-hint').textContent =
+        `(${fmtCost(minC)}–${fmtCost(maxC)})`;
+    }
+    // Range hint: 全局成本占比%
+    const costPctVals = allData.map(r => +(r['全局成本占比%'] || 0)).filter(v => v > 0);
+    if (costPctVals.length) {
+      const minC = Math.min(...costPctVals);
+      const maxC = Math.max(...costPctVals);
+      document.getElementById('cost-pct-range-hint').textContent =
+        `(${fmtPct(minC)}–${fmtPct(maxC)})`;
+    }
+
+    show('loading-state', false);
+    show('main-content', true);
+    applyFilters();
+
+    // 检查 Excel 是否已就绪，若还在写入则显示"准备中"并轮询
+    pollExcelReady();
+
+  } catch (err) {
+    show('loading-state', false);
+    document.getElementById('error-msg').textContent = String(err);
+    show('error-state', true);
+  }
+}
+
+/* ── Excel 就绪轮询 ── */
+async function pollExcelReady() {
+  const btn     = document.getElementById('export-btn');
+  const icon    = document.getElementById('export-icon');
+  const spinner = document.getElementById('export-spinner');
+  const label   = document.getElementById('export-label');
+
+  async function check() {
+    try {
+      const res  = await fetch(`/api/excel_ready/${TOKEN}`);
+      const json = await res.json();
+      return json.ready === true;
+    } catch { return false; }
+  }
+
+  if (await check()) return;   // 已就绪，无需等待
+
+  // 进入"准备中"状态
+  btn.removeAttribute('href');
+  btn.style.opacity = '0.7';
+  btn.style.cursor  = 'not-allowed';
+  icon.classList.add('hidden');
+  spinner.classList.remove('hidden');
+  label.textContent = '准备中…';
+
+  // 每 2 秒轮询一次，最多等 3 分钟
+  let waited = 0;
+  const iv = setInterval(async () => {
+    waited += 2;
+    if (await check() || waited > 180) {
+      clearInterval(iv);
+      // 恢复按钮
+      btn.href          = `/api/download/${TOKEN}`;
+      btn.style.opacity = '';
+      btn.style.cursor  = '';
+      icon.classList.remove('hidden');
+      spinner.classList.add('hidden');
+      label.textContent = '导出 Excel';
+    }
+  }, 2000);
+}
+
+/* ── Filters ── */
+function applyFilters() {
+  const search       = (document.getElementById('search-input').value || '').trim().toLowerCase();
+  const minProd      = parseFloat(document.getElementById('min-prod-filter').value) || 0;
+  const minAvgPct    = parseFloat(document.getElementById('pct-filter').value) || 0;
+  const minCost      = parseFloat(document.getElementById('cost-filter').value) || 0;
+  const minCostPct   = parseFloat(document.getElementById('cost-pct-filter').value) || 0;
+
+  filteredData = allData.filter(row => {
+    if (search     && !String(row['组件编码'] || '').toLowerCase().includes(search)) return false;
+    if (minProd    > 0 && (+(row['涉及产品数'] || 0)) < minProd) return false;
+    if (minAvgPct  > 0 && (+(row['平均用量占比%（在各产品中）'] || 0)) < minAvgPct) return false;
+    if (minCost    > 0 && (+(row['全局总成本贡献'] || 0)) < minCost) return false;
+    if (minCostPct > 0 && (+(row['全局成本占比%'] || 0)) < minCostPct) return false;
+    return true;
+  });
+
+  const isFiltered = search || minProd > 0 || minAvgPct > 0 || minCost > 0 || minCostPct > 0;
+  const hint = document.getElementById('filter-hint');
+  if (isFiltered) {
+    hint.textContent = `已筛选：显示 ${filteredData.length} / ${allData.length} 个组件`;
+    hint.classList.remove('hidden');
+  } else {
+    hint.classList.add('hidden');
+  }
+
+  sortAndRender();
+}
+
+function resetFilters() {
+  document.getElementById('search-input').value    = '';
+  document.getElementById('min-prod-filter').value = '';
+  document.getElementById('pct-filter').value      = '';
+  document.getElementById('cost-filter').value     = '';
+  document.getElementById('cost-pct-filter').value = '';
+  applyFilters();
+}
+
+/* ── Sort ── */
+function sortBy(col) {
+  if (sortCol === col) {
+    sortAsc = !sortAsc;
+  } else {
+    sortCol = col;
+    sortAsc = false;
+  }
+  sortAndRender();
+}
+
+function sortAndRender() {
+  const asc = sortAsc;
+  const col = sortCol;
+  filteredData.sort((a, b) => {
+    const av = a[col], bv = b[col];
+    if (av === null || av === undefined) return 1;
+    if (bv === null || bv === undefined) return -1;
+    if (typeof av === 'number' && typeof bv === 'number') return asc ? av - bv : bv - av;
+    return asc
+      ? String(av).localeCompare(String(bv), 'zh')
+      : String(bv).localeCompare(String(av), 'zh');
+  });
+
+  // Update sort icons
+  ['涉及产品数', '全局总成本贡献', '全局总用量', '平均用量占比%（在各产品中）', '全局成本占比%'].forEach(c => {
+    const el = document.getElementById('sort-icon-' + c);
+    if (!el) return;
+    if (c === col) {
+      el.textContent = asc ? '↑' : '↓';
+      el.className = 'ml-1 text-indigo-500';
+    } else {
+      el.textContent = '↕';
+      el.className = 'ml-1 opacity-30';
+    }
+  });
+
+  renderTable();
+}
+
+/* ── Render main table ── */
+function renderTable() {
+  const tbody = document.getElementById('main-tbody');
+  const empty = document.getElementById('table-empty');
+  const footer = document.getElementById('table-footer');
+  const footerCount = document.getElementById('footer-count');
+  const kpiShown = document.getElementById('kpi-shown');
+
+  kpiShown.textContent = fmt(filteredData.length);
+
+  if (filteredData.length === 0) {
+    tbody.innerHTML = '';
+    show('table-empty', true);
+    footerCount.textContent = '共 0 行';
+    return;
+  }
+  show('table-empty', false);
+  footerCount.textContent = `共 ${fmt(filteredData.length)} 行`;
+
+  tbody.innerHTML = filteredData.map((row, i) => {
+    const comp     = esc(row['组件编码'] || '—');
+    const prodCnt  = +(row['涉及产品数'] || 0);
+    const cost     = +(row['全局总成本贡献'] || 0);
+    const qty      = +(row['全局总用量'] || 0);
+    const avgPct   = +(row['平均用量占比%（在各产品中）'] || 0);
+    const pct      = +(row['全局成本占比%'] || 0);
+    // 绝对比例：pct 本身已是 0-100 的百分比数值，直接作为进度条宽度
+    // 极小非零值保证最小可见宽度 1.5%，让用户知道"有值"
+    const barW     = pct > 0 ? Math.max(1.5, Math.min(100, pct)) : 0;
+    const bg       = i % 2 === 0 ? 'bg-white' : 'bg-slate-50/50';
+
+    return `<tr class="trow ${bg}">
+      <td class="px-4 py-3 nowrap font-mono text-xs font-semibold text-slate-700">${comp}</td>
+      <td class="px-4 py-3 text-center">
+        <button class="count-badge" data-comp="${esc(String(row['组件编码'] ?? ''))}">
+          ${fmt(prodCnt)}
+        </button>
+      </td>
+      <td class="px-4 py-3 nowrap text-right text-slate-700">${fmtCost(cost)}</td>
+      <td class="px-4 py-3 nowrap text-right text-slate-600">${fmtNum(qty)}</td>
+      <td class="px-4 py-3 nowrap text-right text-slate-600">${fmtPct(avgPct)}</td>
+      <td class="px-4 py-3 nowrap min-w-[200px]">
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-slate-700 w-16 text-right flex-shrink-0">${fmtPct(pct)}</span>
+          <div class="pct-bar-bg flex-1" title="全局成本占比：${pct}%">
+            <div class="pct-bar-fill" style="width:${barW.toFixed(2)}%"></div>
+          </div>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+/* ── Show detail modal ── */
+async function showDetail(componentCode) {
+  const comp = String(componentCode);
+  document.getElementById('modal-component-code').textContent = comp;
+  document.getElementById('modal-component-name').textContent = '';
+  document.getElementById('modal-count-info').textContent = '—';
+  document.getElementById('detail-pct-filter').value = '';
+  document.getElementById('detail-tbody').innerHTML = '';
+  document.getElementById('detail-footer-count').textContent = '加载中…';
+  show('detail-empty', false);
+  show('detail-loading', true);
+  show('detail-modal', true);
+  document.body.style.overflow = 'hidden';
+
+  try {
+    const url = `/api/bi/detail/${TOKEN}?component=${encodeURIComponent(comp)}`;
+    const res  = await fetch(url);
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || '加载失败');
+
+    detailRaw = json.data || [];
+    show('detail-loading', false);
+
+    // Check if name/unit columns exist
+    hasName = detailRaw.some(r => r['组件名称'] !== null && r['组件名称'] !== undefined && r['组件名称'] !== '');
+    hasUnit = detailRaw.some(r => r['计量单位'] !== null && r['计量单位'] !== undefined && r['计量单位'] !== '');
+
+    // Show component name in header if available
+    if (hasName && detailRaw.length > 0) {
+      const name = detailRaw[0]['组件名称'];
+      if (name) document.getElementById('modal-component-name').textContent = name;
+    }
+
+    toggleEl('dth-name', hasName);
+    toggleEl('dth-unit', hasUnit);
+    document.getElementById('modal-count-info').textContent = json.count;
+
+    applyDetailFilter();
+  } catch (err) {
+    show('detail-loading', false);
+    toast('加载详情失败：' + String(err), 'error');
+  }
+}
+
+/* ── Detail filter ── */
+function applyDetailFilter() {
+  const minPct = parseFloat(document.getElementById('detail-pct-filter').value) || 0;
+  detailFiltered = detailRaw.filter(row => {
+    if (minPct > 0 && (+(row['用量占比%'] || 0)) < minPct) return false;
+    return true;
+  });
+  renderDetailTable();
+}
+
+function resetDetailFilter() {
+  document.getElementById('detail-pct-filter').value = '';
+  applyDetailFilter();
+}
+
+function renderDetailTable() {
+  const tbody = document.getElementById('detail-tbody');
+  const empty = document.getElementById('detail-empty');
+  const footerCount = document.getElementById('detail-footer-count');
+
+  if (detailFiltered.length === 0) {
+    tbody.innerHTML = '';
+    show('detail-empty', true);
+    footerCount.textContent = '0 条记录';
+    return;
+  }
+  show('detail-empty', false);
+  footerCount.textContent = `共 ${fmt(detailFiltered.length)} 条 / 原始 ${fmt(detailRaw.length)} 条`;
+
+  tbody.innerHTML = detailFiltered.map((row, i) => {
+    const bg   = i % 2 === 0 ? 'bg-white' : 'bg-slate-50/50';
+    const prod = esc(row['产品编码'] || '—');
+    const name = esc(row['组件名称'] || '—');
+    const unit = esc(row['计量单位'] || '—');
+    const qty  = +(row['MENGE合计'] || 0);
+    const pct  = +(row['用量占比%'] || 0);
+    const cost = +(row['行原材料成本'] || 0);
+    const up   = +(row['组件单价'] || 0);
+
+    return `<tr class="trow ${bg}">
+      <td class="px-4 py-2.5 font-mono text-xs font-semibold text-slate-700 nowrap">${prod}</td>
+      ${hasName ? `<td class="px-4 py-2.5 text-xs text-slate-600 nowrap">${name}</td>` : ''}
+      ${hasUnit ? `<td class="px-4 py-2.5 text-xs text-slate-500 nowrap">${unit}</td>` : ''}
+      <td class="px-4 py-2.5 text-right nowrap font-medium text-slate-800">${fmtNum(qty)}</td>
+      <td class="px-4 py-2.5 text-right nowrap">
+        <span class="inline-block bg-indigo-50 text-indigo-700 text-xs px-2 py-0.5 rounded-full font-medium">${fmtPct(pct)}</span>
+      </td>
+      <td class="px-4 py-2.5 text-right nowrap text-slate-700">${fmtCost(cost)}</td>
+      <td class="px-4 py-2.5 text-right nowrap text-slate-500 text-xs">${fmtNum(up)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function closeDetail() {
+  show('detail-modal', false);
+  document.body.style.overflow = '';
+  detailRaw = [];
+  detailFiltered = [];
+}
+
+/* ── Helpers ── */
+function show(id, visible) {
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle('hidden', !visible);
+}
+
+function toggleEl(id, visible) {
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle('hidden', !visible);
+}
+
+function fmt(n) {
+  return Number(n).toLocaleString('zh-CN');
+}
+
+function fmtNum(n) {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  const num = +n;
+  if (Math.abs(num) >= 1e6) return (num / 1e6).toFixed(2) + ' M';
+  if (Math.abs(num) >= 1e3) return num.toLocaleString('zh-CN', {maximumFractionDigits: 2});
+  return num.toLocaleString('zh-CN', {maximumFractionDigits: 4});
+}
+
+/* 自适应精度百分比：避免将 0.0063% 显示为 0.00% */
+function fmtPct(n) {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  const v = +n;
+  if (v === 0) return '0%';
+  if (v >= 0.01)   return v.toFixed(2) + '%';
+  if (v >= 0.001)  return v.toFixed(3) + '%';
+  if (v >= 0.0001) return v.toFixed(4) + '%';
+  return '<0.0001%';
+}
+
+function fmtCost(n) {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  const num = +n;
+  if (Math.abs(num) >= 1e8) return (num / 1e8).toFixed(2) + ' 亿';
+  if (Math.abs(num) >= 1e4) return (num / 1e4).toFixed(2) + ' 万';
+  return num.toLocaleString('zh-CN', {maximumFractionDigits: 2});
+}
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+/* ── Toast ── */
+function toast(msg, type = 'info') {
+  const wrap  = document.getElementById('toast-wrap');
+  const el    = document.createElement('div');
+  const color = { success: 'bg-green-600', error: 'bg-red-600', info: 'bg-slate-700' }[type] || 'bg-slate-700';
+  el.className = `t-in pointer-events-auto flex items-center gap-3 ${color} text-white text-sm font-medium px-4 py-3 rounded-xl shadow-lg max-w-xs`;
+  el.innerHTML = `<span>${esc(msg)}</span>`;
+  wrap.appendChild(el);
+  setTimeout(() => {
+    el.classList.replace('t-in', 't-out');
+    setTimeout(() => el.remove(), 300);
+  }, 4000);
+}
+
+/* ══════════════════════════════════════════════════════════
+   Tab 切换
+══════════════════════════════════════════════════════════ */
+function switchTab(name) {
+  ['cost', 'price'].forEach(t => {
+    document.getElementById('tab-' + t + '-content').classList.toggle('hidden', t !== name);
+    const btn = document.getElementById('tab-btn-' + t);
+    if (btn) btn.classList.toggle('active', t === name);
+  });
+}
+
+/* ══════════════════════════════════════════════════════════
+   价格波动分析
+══════════════════════════════════════════════════════════ */
+let pfData         = [];
+let pfCatData      = [];   // raw category impact from API
+let pfHasCategory  = false;
+let pfHasName      = false;
+let pfSortCol      = '价格差值';
+let pfSortAsc      = false;   // false = 降序（默认：最大涨幅在前）
+
+async function queryPriceFluctuation() {
+  const rawStart = document.getElementById('pf-start-date').value;
+  const rawEnd   = document.getElementById('pf-end-date').value;
+  const minPct   = document.getElementById('pf-min-pct').value || '0';
+
+  if (!rawStart || !rawEnd) {
+    toast('请先选择开始日期和结束日期', 'error');
+    return;
+  }
+  if (rawStart > rawEnd) {
+    toast('开始日期不能晚于结束日期', 'error');
+    return;
+  }
+
+  const startDate = rawStart.replace(/-/g, '');
+  const endDate   = rawEnd.replace(/-/g, '');
+
+  show('pf-init-hint', false);
+  show('pf-loading', true);
+  show('pf-results', false);
+
+  try {
+    const url = `/api/bi/price_fluctuation/${TOKEN}?start_date=${startDate}&end_date=${endDate}&min_change_pct=${minPct}`;
+    const res  = await fetch(url);
+    const json = await res.json();
+
+    show('pf-loading', false);
+
+    if (!res.ok) {
+      toast((json.error || '查询失败'), 'error');
+      show('pf-init-hint', true);
+      return;
+    }
+
+    if (json.message) {
+      toast(json.message, 'info');
+    }
+
+    pfData        = json.data          || [];
+    pfHasCategory = json.has_category  || false;
+    pfHasName     = json.has_name      || false;
+    pfSortCol     = '价格差值';
+    pfSortAsc     = false;
+    // 重置列头图标
+    ['价格差值', '价格变动%'].forEach(c => {
+      const el = document.getElementById('pf-sort-icon-' + c);
+      if (!el) return;
+      el.textContent = c === '价格差值' ? '↓' : '↕';
+      el.className   = c === '价格差值' ? 'ml-0.5 text-indigo-500' : 'ml-0.5 opacity-30';
+    });
+
+    renderPfKpi(json);
+    renderPfTable();
+    renderPfCategoryImpact(json.category_impact || []);
+    renderPfAdvice(json.category_impact || []);
+
+    show('pf-results', true);
+
+  } catch (err) {
+    show('pf-loading', false);
+    show('pf-init-hint', true);
+    toast('查询失败：' + String(err), 'error');
+  }
+}
+
+function resetPriceFilter() {
+  document.getElementById('pf-start-date').value = '';
+  document.getElementById('pf-end-date').value   = '';
+  document.getElementById('pf-min-pct').value    = '';
+  show('pf-results', false);
+  show('pf-init-hint', true);
+  pfData    = [];
+  pfCatData = [];
+  pfSortCol = '价格差值';
+  pfSortAsc = false;
+}
+
+async function queryAiPurchaseAdvice() {
+  show('ai-advice-panel', false);
+  show('ai-advice-loading', true);
+  document.getElementById('ai-advice-text').innerHTML = '';
+
+  try {
+    const res = await fetch(`/api/bi/ai_purchase_advice_stream/${TOKEN}`);
+    if (!res.ok) {
+      const json = await res.json().catch(() => ({}));
+      toast(json.error || 'AI 建议生成失败', 'error');
+      show('ai-advice-loading', false);
+      return;
+    }
+
+    show('ai-advice-loading', false);
+    show('ai-advice-panel', true);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    let markdown = '';
+    let hadError = false;
+    let renderTimer = null;
+    let lastRenderedMarkdown = '';
+    const adviceTextEl = document.getElementById('ai-advice-text');
+
+    function renderAdviceNow(force = false) {
+      if (!force && markdown === lastRenderedMarkdown) return;
+      lastRenderedMarkdown = markdown;
+      adviceTextEl.innerHTML = renderMarkdown(markdown);
+    }
+
+    function scheduleAdviceRender() {
+      if (renderTimer) return;
+      renderTimer = setTimeout(() => {
+        renderTimer = null;
+        renderAdviceNow(false);
+      }, 160);
+    }
+
+    function handleSseBlock(block) {
+      if (!block.trim()) return;
+      let event = 'message';
+      const dataLines = [];
+      for (const line of block.split(/\r?\n/)) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+      }
+      if (!dataLines.length) return;
+      const data = JSON.parse(dataLines.join('\n'));
+
+      if (event === 'meta') {
+        const range = data.date_range || {};
+        document.getElementById('ai-advice-range').textContent =
+          range.start && range.end ? `分析区间：${range.start} 至 ${range.end}` : '分析区间：最近三个月';
+        document.getElementById('ai-advice-total').textContent = `共 ${fmt(data.total || 0)} 个物料`;
+        renderAiMaterialsPreview(data.materials || []);
+      } else if (event === 'delta') {
+        markdown += data.text || '';
+        scheduleAdviceRender();
+      } else if (event === 'error') {
+        hadError = true;
+        toast(data.error || 'AI 建议生成失败', 'error');
+      } else if (event === 'done') {
+        if (renderTimer) {
+          clearTimeout(renderTimer);
+          renderTimer = null;
+        }
+        renderAdviceNow(true);
+        if (!hadError) toast('AI 采购建议已生成', 'success');
+      }
+    }
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split(/\r?\n\r?\n/);
+      buffer = parts.pop() || '';
+      for (const part of parts) handleSseBlock(part);
+    }
+    if (buffer.trim()) handleSseBlock(buffer);
+    if (renderTimer) {
+      clearTimeout(renderTimer);
+      renderTimer = null;
+    }
+    renderAdviceNow(true);
+  } catch (err) {
+    show('ai-advice-loading', false);
+    toast('AI 建议生成失败：' + String(err), 'error');
+  }
+}
+
+function renderAiMaterialsPreview(materials) {
+  const rows = materials.slice(0, 10);
+  const tbody = document.getElementById('ai-materials-tbody');
+  if (!rows.length) {
+    tbody.innerHTML = '';
+    show('ai-materials-preview', false);
+    return;
+  }
+
+  tbody.innerHTML = rows.map(r => {
+    return `<tr>
+      <td class="px-3 py-2 text-slate-700 nowrap">${esc(r['物料名称'] || '—')}</td>
+      <td class="px-3 py-2 font-mono text-slate-600 nowrap">${esc(r['组件编码'] || '—')}</td>
+      <td class="px-3 py-2 text-right font-mono text-slate-500 nowrap">${fmt(r['涉及产品数'] || 0)}</td>
+      <td class="px-3 py-2 text-right font-mono text-slate-500 nowrap">${fmt(r['记录数'] || 0)}</td>
+    </tr>`;
+  }).join('');
+  show('ai-materials-preview', true);
+}
+
+function renderMarkdown(md) {
+  const lines = esc(md).split(/\r?\n/);
+  let html = '';
+  let inList = false;
+  let inTable = false;
+
+  function inline(text) {
+    return text
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  }
+
+  function closeTable() {
+    if (inTable) {
+      html += '</tbody></table></div>';
+      inTable = false;
+    }
+  }
+
+  function closeList() {
+    if (inList) {
+      html += '</ul>';
+      inList = false;
+    }
+  }
+
+  function isTableSeparator(line) {
+    return /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$/.test(line);
+  }
+
+  function parseTableCells(line) {
+    return line
+      .replace(/^\|/, '')
+      .replace(/\|$/, '')
+      .split('|')
+      .map(cell => inline(cell.trim()));
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const line = raw.trim();
+    if (!line) {
+      closeList();
+      closeTable();
+      html += '<br>';
+      continue;
+    }
+    if (/^-{3,}$/.test(line)) continue;
+
+    const nextLine = (lines[i + 1] || '').trim();
+    if (line.includes('|') && nextLine && isTableSeparator(nextLine)) {
+      closeList();
+      closeTable();
+      const headers = parseTableCells(line);
+      html += '<div class="md-table-wrap"><table><thead><tr>';
+      html += headers.map(h => `<th>${h}</th>`).join('');
+      html += '</tr></thead><tbody>';
+      inTable = true;
+      i++; // skip separator
+      continue;
+    }
+
+    if (inTable && line.includes('|') && !isTableSeparator(line)) {
+      const cells = parseTableCells(line);
+      html += '<tr>' + cells.map(c => `<td>${c}</td>`).join('') + '</tr>';
+      continue;
+    }
+
+    closeTable();
+
+    if (line.startsWith('## ')) {
+      closeList();
+      html += `<h2>${inline(line.slice(3))}</h2>`;
+    } else if (line.startsWith('### ')) {
+      closeList();
+      html += `<h3>${inline(line.slice(4))}</h3>`;
+    } else if (/^[-*]\s+/.test(line) || /^\d+\.\s+/.test(line)) {
+      if (!inList) { html += '<ul>'; inList = true; }
+      html += `<li>${inline(line.replace(/^[-*]\s+/, '').replace(/^\d+\.\s+/, ''))}</li>`;
+    } else {
+      closeList();
+      html += `<p>${inline(line)}</p>`;
+    }
+  }
+  closeList();
+  closeTable();
+  return html;
+}
+
+function pfSortBy(col) {
+  if (pfSortCol === col) {
+    pfSortAsc = !pfSortAsc;
+  } else {
+    pfSortCol = col;
+    pfSortAsc = false;
+  }
+  // 更新列头图标
+  ['价格差值', '价格变动%'].forEach(c => {
+    const el = document.getElementById('pf-sort-icon-' + c);
+    if (!el) return;
+    if (c === pfSortCol) {
+      el.textContent = pfSortAsc ? '↑' : '↓';
+      el.className = 'ml-0.5 text-indigo-500';
+    } else {
+      el.textContent = '↕';
+      el.className = 'ml-0.5 opacity-30';
+    }
+  });
+  renderPfTable();
+}
+
+function renderPfKpi(json) {
+  document.getElementById('pf-kpi-total').textContent = fmt(json.total || 0);
+
+  const dr = json.date_range || {};
+  const fmt8 = d => d ? `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}` : '—';
+  document.getElementById('pf-kpi-range').textContent =
+    (dr.start && dr.end) ? `${fmt8(dr.start)} → ${fmt8(dr.end)}` : '—';
+
+  const ups   = pfData.filter(r => r['价格变动%'] > 0).sort((a,b) => b['价格变动%'] - a['价格变动%']);
+  const downs = pfData.filter(r => r['价格变动%'] < 0).sort((a,b) => a['价格变动%'] - b['价格变动%']);
+
+  if (ups.length > 0) {
+    document.getElementById('pf-kpi-max-up').textContent =
+      `${ups[0]['组件编码']} (+${ups[0]['价格变动%'].toFixed(1)}%)`;
+  } else {
+    document.getElementById('pf-kpi-max-up').textContent = '无涨价';
+    document.getElementById('pf-kpi-max-up').className = 'text-lg font-bold text-slate-400 truncate';
+  }
+
+  if (downs.length > 0) {
+    document.getElementById('pf-kpi-max-down').textContent =
+      `${downs[0]['组件编码']} (${downs[0]['价格变动%'].toFixed(1)}%)`;
+  } else {
+    document.getElementById('pf-kpi-max-down').textContent = '无降价';
+    document.getElementById('pf-kpi-max-down').className = 'text-lg font-bold text-slate-400 truncate';
+  }
+}
+
+function renderPfTable() {
+  const tbody      = document.getElementById('pf-tbody');
+  const empty      = document.getElementById('pf-table-empty');
+  const footerCount = document.getElementById('pf-footer-count');
+
+  toggleEl('pf-th-name', pfHasName);
+  toggleEl('pf-th-cat',  pfHasCategory);
+
+  // 按当前排序列排序
+  const col = pfSortCol;
+  const asc = pfSortAsc;
+  pfData.sort((a, b) => {
+    const av = a[col] ?? -Infinity;
+    const bv = b[col] ?? -Infinity;
+    return asc ? av - bv : bv - av;
+  });
+
+  if (pfData.length === 0) {
+    tbody.innerHTML = '';
+    show('pf-table-empty', true);
+    footerCount.textContent = '共 0 行';
+    return;
+  }
+  show('pf-table-empty', false);
+  footerCount.textContent = `共 ${fmt(pfData.length)} 行`;
+
+  tbody.innerHTML = pfData.map((row, i) => {
+    const pct       = +(row['价格变动%'] || 0);
+    const diff      = +(row['价格差值']  || 0);
+    const bg        = i % 2 === 0 ? 'bg-white' : 'bg-slate-50/50';
+    const pctClass  = pct > 0 ? 'badge-up' : (pct < 0 ? 'badge-down' : 'badge-flat');
+    const pctArrow  = pct > 0 ? '▲' : (pct < 0 ? '▼' : '—');
+    const diffColor = diff > 0 ? 'text-red-600' : (diff < 0 ? 'text-green-600' : 'text-slate-500');
+    const diffSign  = diff > 0 ? '+' : '';
+
+    return `<tr class="trow ${bg}" data-comp="${esc(String(row['组件编码'] || ''))}">
+      <td class="px-4 py-2.5 text-xs text-slate-400">${i + 1}</td>
+      <td class="px-4 py-2.5 font-mono text-xs font-semibold text-slate-700 nowrap">${esc(row['组件编码'] || '—')}</td>
+      ${pfHasName ? `<td class="px-4 py-2.5 text-xs text-slate-600 nowrap">${esc(row['组件名称'] || '—')}</td>` : ''}
+      ${pfHasCategory ? `<td class="px-4 py-2.5 text-xs nowrap">
+        <span class="inline-block px-2 py-0.5 bg-indigo-50 text-indigo-700 rounded-full text-xs">${esc(row['分类'] || '—')}</span>
+      </td>` : ''}
+      <td class="px-4 py-2.5 text-right nowrap text-slate-700 text-xs font-mono">${fmtPrice(row['期初价格'])}</td>
+      <td class="px-4 py-2.5 text-right nowrap text-slate-700 text-xs font-mono">${fmtPrice(row['期末价格'])}</td>
+      <td class="px-4 py-2.5 text-right nowrap text-xs font-mono font-semibold ${diffColor}">${diffSign}${fmtPrice(diff)}</td>
+      <td class="px-4 py-2.5 text-right nowrap">
+        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold ${pctClass}">
+          ${pctArrow} ${Math.abs(pct).toFixed(2)}%
+        </span>
+      </td>
+      <td class="px-4 py-2.5 text-right nowrap text-slate-500 text-xs font-mono">${fmtPrice(row['期间最低价'])}</td>
+      <td class="px-4 py-2.5 text-right nowrap text-slate-500 text-xs font-mono">${fmtPrice(row['期间最高价'])}</td>
+      <td class="px-4 py-2.5 text-center text-xs text-slate-600">${row['涉及产品数'] || 0}</td>
+    </tr>`;
+  }).join('');
+}
+
+/* 根据阈值计算影响等级（客户端，支持用户调整） */
+function computeLevel(absMax) {
+  const high = parseFloat(document.getElementById('pf-level-high').value) || 10;
+  const mid  = parseFloat(document.getElementById('pf-level-mid').value)  || 3;
+  return absMax >= high ? '高' : (absMax >= mid ? '中' : '低');
+}
+
+function renderPfCategoryImpact(catImpact) {
+  pfCatData = catImpact;   // 保存原始数据供阈值变更时重新渲染
+  _drawCatTable();
+}
+
+function recomputeImpactLevels() {
+  if (!pfCatData.length) return;
+  _drawCatTable();
+  // 同步更新建议区（影响等级可能变化）
+  renderPfAdvice(pfCatData);
+}
+
+function _drawCatTable() {
+  const section = document.getElementById('pf-cat-section');
+  const tbody   = document.getElementById('pf-cat-tbody');
+
+  if (!pfHasCategory || pfCatData.length === 0) {
+    show('pf-cat-section', false);
+    return;
+  }
+
+  const levelClass = { '高': 'level-high', '中': 'level-mid', '低': 'level-low' };
+
+  tbody.innerHTML = pfCatData.map((row, i) => {
+    const bg     = i % 2 === 0 ? 'bg-white' : 'bg-slate-50/50';
+    const avg    = +(row['平均变动%']    || 0);
+    const maxUp  = +(row['最大涨幅%']    || 0);
+    const maxDn  = +(row['最大跌幅%']    || 0);
+    const level  = computeLevel(Math.abs(avg));   // 用平均变动%绝对值与阈值比较
+    const lc     = levelClass[level] || 'level-low';
+    const catVal = esc(row['分类']);
+
+    return `<tr class="trow ${bg}">
+      <td class="px-4 py-2.5 font-semibold text-slate-700 text-sm nowrap">${catVal}</td>
+      <td class="px-4 py-2.5 text-right nowrap text-slate-600">${fmt(row['涉及组件数'])}</td>
+      <td class="px-4 py-2.5 text-right nowrap font-medium ${avg >= 0 ? 'text-red-600' : 'text-green-600'}">${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%</td>
+      <td class="px-4 py-2.5 text-right nowrap text-red-600 font-medium jump-cell"
+          onclick="jumpToComp('${catVal}','up')" title="点击定位该分类最大涨幅组件">
+        +${maxUp.toFixed(2)}%
+      </td>
+      <td class="px-4 py-2.5 text-right nowrap text-green-600 font-medium jump-cell"
+          onclick="jumpToComp('${catVal}','down')" title="点击定位该分类最大跌幅组件">
+        ${maxDn.toFixed(2)}%
+      </td>
+      <td class="px-4 py-2.5 text-right nowrap text-slate-500 text-xs">${fmt(row['上涨组件数'])} ↑ / ${fmt(row['下跌组件数'])} ↓</td>
+      <td class="px-4 py-2.5 text-center nowrap">
+        <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold ${lc}">${level}</span>
+      </td>
+    </tr>`;
+  }).join('');
+
+  show('pf-cat-section', true);
+}
+
+/* 跳转到分类中最大涨幅（up）或最大跌幅（down）的组件行 */
+function jumpToComp(cat, direction) {
+  const candidates = pfData.filter(r => String(r['分类'] || '') === cat);
+  if (!candidates.length) { toast('该分类下暂无组件数据', 'info'); return; }
+
+  const target = direction === 'up'
+    ? candidates.reduce((best, r) => (+(r['价格变动%'] || 0)) > (+(best['价格变动%'] || 0)) ? r : best)
+    : candidates.reduce((best, r) => (+(r['价格变动%'] || 0)) < (+(best['价格变动%'] || 0)) ? r : best);
+
+  const compCode = String(target['组件编码'] || '');
+  const rows = document.querySelectorAll('#pf-tbody tr[data-comp]');
+  let targetRow = null;
+  for (const row of rows) {
+    if (row.dataset.comp === compCode) { targetRow = row; break; }
+  }
+
+  if (!targetRow) {
+    toast(`未找到组件 ${compCode}（可能已被百分比过滤隐藏）`, 'info');
+    return;
+  }
+
+  // 清除上一次高亮（避免重复点击时动画残留）
+  targetRow.classList.remove('pf-highlight');
+  void targetRow.offsetWidth;
+
+  // 用 IntersectionObserver 监听行真正进入视口后再触发高亮，
+  // 确保滚动动画完成时高亮才开始，不受滚动距离影响。
+  const observer = new IntersectionObserver((entries, obs) => {
+    const entry = entries[0];
+    if (entry.isIntersecting) {
+      obs.disconnect();
+      // 再次强制 reflow，防止 remove+add 在同一帧被合并
+      void entry.target.offsetWidth;
+      entry.target.classList.add('pf-highlight');
+      setTimeout(() => entry.target.classList.remove('pf-highlight'), 3600);
+    }
+  }, { threshold: 0.6 });   // 行至少 60% 可见时才触发
+
+  observer.observe(targetRow);
+  targetRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+  // 安全超时：若 5s 内元素始终未进入视口（被遮挡等），取消观察
+  setTimeout(() => observer.disconnect(), 5000);
+}
+
+function renderPfAdvice(catImpact) {
+  const adviceEl = document.getElementById('pf-advice');
+  const textEl   = document.getElementById('pf-advice-text');
+
+  if (pfData.length === 0) {
+    show('pf-advice', false);
+    return;
+  }
+
+  const lines = [];
+
+  // 价格上涨的高影响分类（用客户端实时计算的等级）
+  if (pfHasCategory) {
+    const withLevel = catImpact.map(c => ({
+      ...c,
+      _level: computeLevel(Math.abs(+(c['平均变动%'] || 0)))
+    }));
+    const highUp   = withLevel.filter(c => c._level === '高' && c['平均变动%'] > 0);
+    const highDown = withLevel.filter(c => c._level === '高' && c['平均变动%'] < 0);
+    const midAll   = withLevel.filter(c => c._level === '中');
+    const highThreshold = parseFloat(document.getElementById('pf-level-high').value) || 10;
+    if (highUp.length > 0) {
+      lines.push(`<strong>重点关注：</strong>「${highUp.map(c => esc(c['分类'])).join('」「')}」类组件均价大幅上涨（最大绝对变动 ≥${highThreshold}%），建议优先评估该类别采购成本并考虑锁价或寻源。`);
+    }
+    if (highDown.length > 0) {
+      lines.push(`<strong>降价机会：</strong>「${highDown.map(c => esc(c['分类'])).join('」「')}」类组件价格出现明显下降，可考虑重新谈判合同价格或追加采购量。`);
+    }
+    if (midAll.length > 0) {
+      lines.push(`<strong>持续跟踪：</strong>「${midAll.map(c => esc(c['分类'])).join('」「')}」类组件波动幅度中等，建议每月复查报价。`);
+    }
+  }
+
+  // 无分类时基于组件数据给出建议
+  if (!pfHasCategory || lines.length === 0) {
+    const upCnt   = pfData.filter(r => r['价格变动%'] > 0).length;
+    const downCnt = pfData.filter(r => r['价格变动%'] < 0).length;
+    const bigUp   = pfData.filter(r => r['价格变动%'] >= 10).length;
+    if (bigUp > 0) {
+      lines.push(`共有 <strong>${bigUp}</strong> 个组件价格涨幅≥10%，建议逐项核实供应商报价合理性，并在产品报价中同步调整成本。`);
+    }
+    if (upCnt > downCnt) {
+      lines.push(`当前区间整体呈涨价趋势（${upCnt} 涨 / ${downCnt} 跌），建议加快推进关键物料锁价。`);
+    } else if (downCnt > upCnt) {
+      lines.push(`当前区间整体呈降价趋势（${downCnt} 跌 / ${upCnt} 涨），可适时重新议价以降低采购成本。`);
+    } else if (pfData.length > 0) {
+      lines.push('所选区间内价格波动，请结合业务实际评估采购策略。');
+    }
+  }
+
+  if (lines.length === 0) {
+    show('pf-advice', false);
+    return;
+  }
+
+  textEl.innerHTML = lines.map(l => `<p>${l}</p>`).join('');
+  show('pf-advice', true);
+}
+
+function fmtPrice(n) {
+  if (n === null || n === undefined || isNaN(+n)) return '—';
+  return (+n).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+}
+</script>
+</body>
+</html>
