@@ -2,6 +2,7 @@
 """分析三表 Excel 中哪些产品满足成本模拟「历史回归」条件。"""
 from __future__ import annotations
 
+import argparse
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -10,7 +11,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 WEB = ROOT / "web"
 sys.path.insert(0, str(WEB))
 sys.path.insert(0, str(ROOT))
@@ -25,17 +26,72 @@ from cost_sim_predict import (  # noqa: E402
     _regression_fit_grade,
 )
 
-DATA = Path(r"C:\Users\00109151\Desktop\数据集")
-OUT = ROOT / "output" / "regression_eligibility_report.txt"
+DEFAULT_DATA = ROOT / "data"
+OUT_TXT = ROOT / "output" / "regression_eligibility_report.txt"
+OUT_MISSING_XLSX = ROOT / "output" / "missing_bom_for_price_products.xlsx"
 
 
 def _norm_codes(s: pd.Series) -> pd.Series:
     return norm_material_code(s)
 
 
+def _prefix_overlap(
+    bom_codes: set[str],
+    price_codes: set[str],
+    lengths: range | None = None,
+) -> list[tuple[int, int, list[tuple[str, str]]]]:
+    """扫描前缀长度，返回 (L, 匹配对数, 样例对照)。"""
+    if lengths is None:
+        lengths = range(5, 13)
+    results: list[tuple[int, int, list[tuple[str, str]]]] = []
+    for n in lengths:
+        bom_pref: dict[str, str] = {}
+        for c in bom_codes:
+            base = c.split("-")[0].strip()
+            if len(base) >= n:
+                bom_pref[base[:n]] = c
+        pairs: list[tuple[str, str]] = []
+        for pc in price_codes:
+            base = pc.split("-")[0].strip()
+            key = base[:n] if len(base) >= n else base
+            if key in bom_pref:
+                pairs.append((bom_pref[key], pc))
+        results.append((n, len(pairs), pairs[:10]))
+    return results
+
+
+def _resolve_data_paths(data_dir: Path) -> tuple[Path, Path]:
+    bom_candidates = [
+        data_dir / "报价BOM历史清单.xls",
+        data_dir / "报价BOM历史清单.xlsx",
+    ]
+    price_candidates = [
+        data_dir / "产品价格历史清单.xls",
+        data_dir / "产品价格历史清单.xlsx",
+    ]
+    bom_path = next((p for p in bom_candidates if p.exists()), bom_candidates[0])
+    price_path = next((p for p in price_candidates if p.exists()), price_candidates[0])
+    return bom_path, price_path
+
+
 def main() -> None:
-    bom_path = DATA / "报价BOM历史清单.xls"
-    price_path = DATA / "产品价格历史清单.xls"
+    parser = argparse.ArgumentParser(description="BOM 与价格清单回归条件诊断")
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DEFAULT_DATA,
+        help=f"数据目录（默认 {DEFAULT_DATA}）",
+    )
+    args = parser.parse_args()
+    data_dir: Path = args.data_dir
+    bom_path, price_path = _resolve_data_paths(data_dir)
+
+    if not bom_path.exists():
+        print(f"未找到 BOM 文件: {bom_path}")
+        sys.exit(1)
+    if not price_path.exists():
+        print(f"未找到价格文件: {price_path}")
+        sys.exit(1)
 
     bom_xl = pd.read_excel(bom_path)
     price_xl = pd.read_excel(price_path)
@@ -49,6 +105,9 @@ def main() -> None:
     lines.append("=" * 60)
     lines.append("BOM + 产品价格历史回归条件分析报告")
     lines.append("=" * 60)
+    lines.append(f"数据目录: {data_dir.resolve()}")
+    lines.append(f"BOM 文件: {bom_path.name}")
+    lines.append(f"价格文件: {price_path.name}")
     lines.append("")
     lines.append("【回归启用条件（与页面一致）】")
     lines.append("  1. 产品编码在 BOM 与 产品价格历史清单 中能对齐")
@@ -69,10 +128,24 @@ def main() -> None:
         lines.append("    *** 当前数据集中为 0，无法对任何产品做完整回归 ***")
         lines.append(f"    BOM 示例: {', '.join(sorted(bom_codes)[:5])}")
         lines.append(f"    价格表示例: {', '.join(sorted(price_codes)[:5])}")
-  # 价格清单：按产品统计可报价期数（有重量）
+
+    lines.append("")
+    lines.append("【前缀匹配诊断（仅建议，不自动用于线上预测）】")
+    prefix_rows = _prefix_overlap(bom_codes, price_codes)
+    for n, cnt, samples in prefix_rows:
+        lines.append(f"  前 {n} 位一致（含 split('-')[0] 后截取）: {cnt} 对")
+        if samples and cnt > 0 and cnt <= 30:
+            for b, p in samples[:5]:
+                lines.append(f"    BOM {b}  <->  价格 {p}")
+    best = max(prefix_rows, key=lambda x: x[1]) if prefix_rows else (0, 0, [])
+    if best[1] > len(overlap):
+        lines.append(
+            f"  提示: 完全匹配 {len(overlap)} 个；若采用前 {best[0]} 位前缀规则可对齐约 {best[1]} 个，"
+            "需业务确认后维护对照表。"
+        )
+
     lines.append("")
 
-    # 价格清单：按产品统计可报价期数（有重量）
     lines.append("-" * 60)
     lines.append("【仅看产品价格历史清单】每期有重量 → 可作「产品价/kg」侧")
     lines.append("-" * 60)
@@ -108,9 +181,19 @@ def main() -> None:
             lines.append(
                 f"    {r['产品编码']}: {int(r['有重量期数'])} 期, BOM中有该产品={in_bom}"
             )
+
+    missing_bom = ok_price[~ok_price["在BOM中"]].head(20)
+    if len(missing_bom):
+        OUT_MISSING_XLSX.parent.mkdir(parents=True, exist_ok=True)
+        export_cols = ["产品编码", "有重量期数", "价格表行数", "清单够3期"]
+        missing_bom[export_cols].to_excel(OUT_MISSING_XLSX, index=False)
+        lines.append("")
+        lines.append(
+            f"  已导出「价格表够3期但 BOM 缺失」Top {len(missing_bom)} 产品: {OUT_MISSING_XLSX}"
+        )
+
     lines.append("")
 
-    # 完整流水线（与 Web 一致）
     lines.append("-" * 60)
     lines.append("【Web 流水线：BOM + 价格清单 → 有效回归样本】")
     lines.append("-" * 60)
@@ -176,21 +259,26 @@ def main() -> None:
             "  根因: BOM(所属产品) 与 价格清单(产品编码) 无交集，"
             "系统无法为任何产品同时构造「BOM材料/kg」与「产品价/kg」配对样本。"
         )
+        if best[1] > 0:
+            lines.append(
+                f"  前缀诊断: 前 {best[0]} 位规则可潜在对齐 {best[1]} 对，"
+                "请导出对照表经业务确认后再接入预测。"
+            )
         lines.append(
             "  建议: ① 确认两表是否应对同一批成品物料号；"
             "② 若业务上为不同编码体系，需维护对照表或统一导出字段；"
-            "③ 仅有价格表 102… 产品时需提供对应 BOM。"
+            "③ 仅有价格表产品时需提供对应 BOM（见 missing_bom Excel）。"
         )
     elif len(eligible) == 0:
         lines.append("  有产品交集但有效样本仍不足 3 期，请补充 BOM 或产品价格历史月份。")
     else:
         lines.append(f"  可直接做回归的产品见上表（共 {len(eligible)} 个）。")
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT_TXT.parent.mkdir(parents=True, exist_ok=True)
     text = "\n".join(lines)
-    OUT.write_text(text, encoding="utf-8")
+    OUT_TXT.write_text(text, encoding="utf-8")
     print(text)
-    print(f"\n已写入: {OUT}")
+    print(f"\n已写入: {OUT_TXT}")
 
 
 if __name__ == "__main__":

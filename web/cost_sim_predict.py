@@ -17,6 +17,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 from bom_date_key import calendar_date_key_yyyymmdd
 from process_excel import (
+    COL_CATEGORY,
     COL_COMPONENT,
     COL_CREATEDATE,
     COL_MAKTX,
@@ -24,6 +25,7 @@ from process_excel import (
     COL_QTY,
     COL_UNIT_PRICE,
     norm_material_code,
+    norm_material_code_scalar,
     normalize_columns,
 )
 
@@ -31,6 +33,12 @@ MAX_REG_FEATURES = 40
 
 # 业务口径：产品价格历史清单中的「单价/成本」均为 元/KG（每公斤）
 PRICE_UNIT_LABEL = "元/KG"
+
+# 传导系数：同分类兜底最少斜率条数 / 最少产品数
+PASS_THROUGH_CATEGORY_MIN_SLOPES = 30
+PASS_THROUGH_CATEGORY_MIN_PRODUCTS = 3
+# Theil-Sen 时间衰减（月）：w = exp(-λ * months_ago)，λ≈0.2 → 半衰期约 3.5 月
+TIME_DECAY_LAMBDA = 0.2
 
 _DATE_ALIASES = ("创建日期", "生价日期", "CREATEDATE", "生产日期", "日期")
 
@@ -68,10 +76,98 @@ def quote_month_key_from_series(s: pd.Series) -> pd.Series:
     return raw.map(_one)
 
 
-def quote_month_key_from_value(v: Any) -> str:
+def quote_month_key_scalar(v: Any) -> str:
+    """单值报价月份 → YYYYMM（与 quote_month_key_from_series 一致）。"""
     if v is None:
         return ""
-    return quote_month_key_from_series(pd.Series([v])).iloc[0]
+    s = norm_material_code_scalar(v)
+    if not s:
+        return ""
+    digits = re.sub(r"\D", "", s)
+    if len(digits) >= 6:
+        return digits[:6]
+    if len(digits) == 4:
+        return digits
+    dk = calendar_date_key_yyyymmdd(s)
+    return dk[:6] if dk and len(dk) >= 6 else ""
+
+
+def quote_month_key_from_value(v: Any) -> str:
+    return quote_month_key_scalar(v)
+
+
+def normalize_predict_dataframes(
+    bom_df: pd.DataFrame | None,
+    price_df: pd.DataFrame | None,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """预测入口一次性规范化物料编码与报价月份，避免热路径反复构造 Series。"""
+    if bom_df is not None and not bom_df.empty:
+        bom_df = bom_df.copy()
+        if COL_PRODUCT in bom_df.columns:
+            bom_df[COL_PRODUCT] = norm_material_code(bom_df[COL_PRODUCT])
+        if COL_COMPONENT in bom_df.columns:
+            bom_df[COL_COMPONENT] = norm_material_code(bom_df[COL_COMPONENT])
+        if COL_CREATEDATE in bom_df.columns:
+            bom_df[COL_CREATEDATE] = bom_df[COL_CREATEDATE].map(calendar_date_key_yyyymmdd)
+    if price_df is not None and not price_df.empty:
+        price_df = price_df.copy()
+        pid_col = COL_PRODUCT if COL_PRODUCT in price_df.columns else None
+        if pid_col is None:
+            for alias in ("ZMATNR", "MATNR", "所属产品"):
+                if alias in price_df.columns:
+                    pid_col = alias
+                    break
+        if pid_col:
+            price_df[pid_col] = norm_material_code(price_df[pid_col])
+        if "报价月份" in price_df.columns:
+            price_df["报价月份"] = quote_month_key_from_series(price_df["报价月份"])
+    return bom_df, price_df
+
+
+def build_product_category_index(bom_df: pd.DataFrame | pl.DataFrame) -> dict[str, str]:
+    """
+    按 BOM 行成本（MENGE×组件单价）汇总，取贡献最大的组件「分类」作为产品 dominant 分类。
+    """
+    if isinstance(bom_df, pl.DataFrame):
+        df = normalize_columns(bom_df)
+    else:
+        if bom_df is None or (hasattr(bom_df, "empty") and bom_df.empty):
+            return {}
+        df = normalize_columns(pl.from_pandas(bom_df))
+
+    if COL_PRODUCT not in df.columns or COL_CATEGORY not in df.columns:
+        return {}
+
+    qty = pl.col(COL_QTY).cast(pl.Float64, strict=False).fill_null(0.0) if COL_QTY in df.columns else pl.lit(0.0)
+    price = (
+        pl.col(COL_UNIT_PRICE).cast(pl.Float64, strict=False).fill_null(0.0)
+        if COL_UNIT_PRICE in df.columns
+        else pl.lit(0.0)
+    )
+    ranked = (
+        df.with_columns(
+            pl.col(COL_PRODUCT)
+            .cast(pl.Utf8)
+            .map_elements(norm_material_code_scalar, return_dtype=pl.Utf8)
+            .alias(COL_PRODUCT),
+            (qty * price).alias("_line_cost"),
+        )
+        .filter(
+            pl.col(COL_PRODUCT).is_not_null()
+            & (pl.col(COL_PRODUCT) != "")
+            & pl.col(COL_CATEGORY).is_not_null()
+            & (pl.col(COL_CATEGORY).cast(pl.Utf8) != "")
+        )
+        .group_by([COL_PRODUCT, COL_CATEGORY])
+        .agg(pl.col("_line_cost").sum().alias("_cat_cost"))
+        .sort([COL_PRODUCT, "_cat_cost"], descending=[False, True])
+    )
+    top = ranked.group_by(COL_PRODUCT).first()
+    return {
+        str(r[COL_PRODUCT]): str(r[COL_CATEGORY])
+        for r in top.to_dicts()
+        if r.get(COL_PRODUCT) and r.get(COL_CATEGORY)
+    }
 
 
 def product_weight_kg(
@@ -335,104 +431,133 @@ def product_total_from_per_kg_fields(
 
 
 def build_product_cost_history(raw_pl: pl.DataFrame) -> dict[str, list[dict[str, Any]]]:
-    """从原始上传表按 产品[+日期] 汇总：BOM 材料合计、产品总价、材料成本、工费。"""
-    raw = normalize_columns(raw_pl).to_pandas()
-    if COL_PRODUCT not in raw.columns or COL_COMPONENT not in raw.columns:
+    """从原始上传表按 产品[+日期] 汇总：BOM 材料合计、产品总价、材料成本、工费（Polars）。"""
+    df = normalize_columns(raw_pl)
+    if COL_PRODUCT not in df.columns or COL_COMPONENT not in df.columns:
         return {}
 
-    raw[COL_PRODUCT] = _norm_code_series(raw[COL_PRODUCT])
-    raw[COL_COMPONENT] = _norm_code_series(raw[COL_COMPONENT])
-    raw["_menge"] = pd.to_numeric(
-        raw[COL_QTY] if COL_QTY in raw.columns else 0, errors="coerce"
-    ).fillna(0.0)
-    raw["_price"] = pd.to_numeric(
-        raw[COL_UNIT_PRICE] if COL_UNIT_PRICE in raw.columns else 0, errors="coerce"
-    ).fillna(0.0)
-    raw["_line"] = raw["_menge"] * raw["_price"]
+    qty = (
+        pl.col(COL_QTY).cast(pl.Float64, strict=False).fill_null(0.0)
+        if COL_QTY in df.columns
+        else pl.lit(0.0)
+    )
+    price = (
+        pl.col(COL_UNIT_PRICE).cast(pl.Float64, strict=False).fill_null(0.0)
+        if COL_UNIT_PRICE in df.columns
+        else pl.lit(0.0)
+    )
 
-    date_col = COL_CREATEDATE if COL_CREATEDATE in raw.columns else None
-    if date_col:
-        raw["_dk"] = raw[date_col].map(calendar_date_key_yyyymmdd).replace("", pd.NA)
+    if COL_CREATEDATE in df.columns:
+        dk_expr = (
+            pl.col(COL_CREATEDATE)
+            .map_elements(
+                lambda v: calendar_date_key_yyyymmdd(v) or "snapshot",
+                return_dtype=pl.Utf8,
+            )
+            .alias("_dk")
+        )
     else:
-        raw["_dk"] = "snapshot"
-
-    product_price_col = "产品价格" if "产品价格" in raw.columns else None
-    mat_cost_col = "材料成本" if "材料成本" in raw.columns else None
-    labor_col = "工费" if "工费" in raw.columns else None
+        dk_expr = pl.lit("snapshot").alias("_dk")
 
     quote_col = next(
-        (c for c in ("报价号", "ZBJNO", "报价流水号", "ZSNO") if c in raw.columns),
+        (c for c in ("报价号", "ZBJNO", "报价流水号", "ZSNO") if c in df.columns),
         None,
     )
     if quote_col:
-        raw["_qv"] = _norm_code_series(raw[quote_col]).replace("", pd.NA)
+        qv_expr = (
+            pl.col(quote_col)
+            .map_elements(norm_material_code_scalar, return_dtype=pl.Utf8)
+            .alias("_qv")
+        )
     else:
-        raw["_qv"] = pd.NA
+        qv_expr = pl.lit(None).cast(pl.Utf8).alias("_qv")
 
-    # 先按 (产品, 报价版本, 日) 汇总单版本成本，再对同日多版本取均值
-    version_daily = (
-        raw.groupby([COL_PRODUCT, "_qv", "_dk"], sort=False, dropna=False)["_line"]
-        .sum()
-        .reset_index()
+    base = df.with_columns(
+        pl.col(COL_PRODUCT)
+        .map_elements(norm_material_code_scalar, return_dtype=pl.Utf8)
+        .alias(COL_PRODUCT),
+        pl.col(COL_COMPONENT)
+        .map_elements(norm_material_code_scalar, return_dtype=pl.Utf8)
+        .alias(COL_COMPONENT),
+        (qty * price).alias("_line"),
+        dk_expr,
+        qv_expr,
     )
-    bom_by_day = (
-        version_daily.groupby([COL_PRODUCT, "_dk"], sort=False)["_line"]
-        .mean()
-        .reset_index()
+
+    version_daily = base.group_by([COL_PRODUCT, "_qv", "_dk"]).agg(
+        pl.col("_line").sum().alias("_line")
     )
-    meta_by_day = raw.groupby([COL_PRODUCT, "_dk"], sort=False).last().reset_index()
+    bom_by_day = version_daily.group_by([COL_PRODUCT, "_dk"]).agg(
+        pl.col("_line").mean().alias("bom_material")
+    )
+
+    meta_cols = [c for c in ("产品价格", "材料成本", "工费", "重量") if c in base.columns]
+    sort_keys = [COL_PRODUCT, "_dk"]
+    if COL_CREATEDATE in base.columns:
+        sort_keys.append(COL_CREATEDATE)
+    meta = base.sort(sort_keys).group_by([COL_PRODUCT, "_dk"]).last()
+    if meta_cols:
+        meta = meta.select([COL_PRODUCT, "_dk", *meta_cols])
+    else:
+        meta = meta.select([COL_PRODUCT, "_dk"])
+
+    joined = bom_by_day.join(meta, on=[COL_PRODUCT, "_dk"], how="left")
 
     out: dict[str, list[dict[str, Any]]] = {}
-    for _, bom_row in bom_by_day.iterrows():
-        pid = str(bom_row[COL_PRODUCT]).strip()
-        dk = bom_row["_dk"]
-        bom_material = float(bom_row["_line"])
+    for rec in joined.to_dicts():
+        pid = str(rec.get(COL_PRODUCT) or "").strip()
+        if not pid:
+            continue
+        dk = rec.get("_dk")
+        bom_material = float(rec.get("bom_material") or 0.0)
         if bom_material <= 1e-12:
             continue
 
-        meta = meta_by_day[
-            (meta_by_day[COL_PRODUCT] == bom_row[COL_PRODUCT])
-            & (meta_by_day["_dk"] == dk)
-        ]
-        grp = meta.iloc[-1:] if len(meta) else pd.DataFrame()
-
-        row: dict[str, Any] = {
-            "date": str(dk) if pd.notna(dk) else "snapshot",
-            "bom_material": round(bom_material, 6),
-        }
         wt_kg: float | None = None
-        if len(grp) and "重量" in grp.columns:
-            wts = pd.to_numeric(grp["重量"], errors="coerce").dropna()
-            if len(wts):
-                wt_kg = float(wts.iloc[-1])
+        if rec.get("重量") is not None:
+            try:
+                w = float(rec["重量"])
+                if w > 1e-12:
+                    wt_kg = w
+            except (TypeError, ValueError):
+                pass
 
         pp_per_kg: float | None = None
-        if product_price_col and len(grp):
-            pp = pd.to_numeric(grp[product_price_col], errors="coerce").dropna()
-            if len(pp):
-                pp_per_kg = float(pp.iloc[-1])
         mat_per_kg: float | None = None
         labor_per_kg: float | None = None
-        if mat_cost_col and len(grp):
-            mc = pd.to_numeric(grp[mat_cost_col], errors="coerce").dropna()
-            if len(mc):
-                mat_per_kg = float(mc.iloc[-1])
-                row["材料成本_per_kg"] = round(mat_per_kg, 6)
-        if labor_col and len(grp):
-            lb = pd.to_numeric(grp[labor_col], errors="coerce").dropna()
-            if len(lb):
-                labor_per_kg = float(lb.iloc[-1])
-                row["工费_per_kg"] = round(labor_per_kg, 6)
+        if rec.get("产品价格") is not None:
+            try:
+                pp_per_kg = float(rec["产品价格"])
+            except (TypeError, ValueError):
+                pass
+        if rec.get("材料成本") is not None:
+            try:
+                mat_per_kg = float(rec["材料成本"])
+            except (TypeError, ValueError):
+                pass
+        if rec.get("工费") is not None:
+            try:
+                labor_per_kg = float(rec["工费"])
+            except (TypeError, ValueError):
+                pass
 
         if pp_per_kg is None and mat_per_kg is not None and labor_per_kg is not None:
             pp_per_kg = mat_per_kg + labor_per_kg
         if pp_per_kg is None:
             continue
 
-        row["product_price_per_kg"] = round(pp_per_kg, 6)
-        row["product_price"] = round(
-            per_kg_to_product_total(pp_per_kg, wt_kg) or pp_per_kg, 6
-        )
+        row: dict[str, Any] = {
+            "date": str(dk) if dk is not None else "snapshot",
+            "bom_material": round(bom_material, 6),
+            "product_price_per_kg": round(pp_per_kg, 6),
+            "product_price": round(
+                per_kg_to_product_total(pp_per_kg, wt_kg) or pp_per_kg, 6
+            ),
+        }
+        if mat_per_kg is not None:
+            row["材料成本_per_kg"] = round(mat_per_kg, 6)
+        if labor_per_kg is not None:
+            row["工费_per_kg"] = round(labor_per_kg, 6)
         if wt_kg is not None:
             row["重量_kg"] = round(wt_kg, 6)
             row["bom_material_per_kg"] = round(bom_material / wt_kg, 6)
@@ -695,6 +820,9 @@ def _linear_fit_predict(
     if n < 3:
         return None, 0.0, n, None, None
 
+    if float(np.std(x)) < 1e-4 or float(np.ptp(x)) < 1e-4:
+        return None, 0.0, n, None, None
+
     X = np.column_stack([np.ones(n), x])
     try:
         beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
@@ -732,17 +860,61 @@ def _history_xy_points(records: list[dict[str, Any]]) -> list[tuple[str, float, 
     return pts
 
 
-def _robust_slopes_from_points(points: list[tuple[str, float, float]]) -> list[float]:
+def _month_index_from_key(dk: str) -> int | None:
+    mk = _timeline_month_key(dk)
+    if not mk or mk in ("snapshot", "nan", "None"):
+        return None
+    digits = re.sub(r"\D", "", mk)
+    if len(digits) < 6:
+        return None
+    try:
+        return int(digits[:4]) * 12 + int(digits[4:6])
+    except ValueError:
+        return None
+
+
+def _weighted_median(values: list[float], weights: list[float]) -> float:
+    if not values:
+        return float("nan")
+    if not weights or len(weights) != len(values) or sum(weights) <= 0:
+        return float(np.nanmedian(np.array(values, dtype=float)))
+    pairs = sorted(zip(values, weights), key=lambda x: x[0])
+    half = sum(weights) / 2.0
+    cum = 0.0
+    for v, w in pairs:
+        cum += w
+        if cum >= half:
+            return float(v)
+    return float(pairs[-1][0])
+
+
+def _aggregate_slopes(
+    slopes: list[float],
+    slope_weights: list[float] | None,
+) -> float:
+    if slope_weights and len(slope_weights) == len(slopes):
+        return _weighted_median(slopes, slope_weights)
+    return float(np.nanmedian(np.array(slopes, dtype=float)))
+
+
+def _robust_slopes_from_points(
+    points: list[tuple[str, float, float]],
+) -> tuple[list[float], list[float] | None]:
     """
     Theil-Sen 风格斜率样本：用所有成对变化估计产品价对 BOM 材料变化的传导。
-    R² 在价格窄幅波动时容易偏低，这里只要求变化方向和量级稳定。
+    返回 (slopes, weights)；若时间键可解析则对较新样本对加权（指数衰减）。
     """
     n = len(points)
     if n < 2:
-        return []
+        return [], None
     xs = np.array([p[1] for p in points], dtype=float)
     dx_floor = max(1e-9, float(np.nanmedian(np.abs(xs))) * 1e-5)
+    month_idxs = [_month_index_from_key(p[0]) for p in points]
+    use_decay = all(m is not None for m in month_idxs)
+    latest_mi = max(month_idxs) if use_decay else None
+
     slopes: list[float] = []
+    weights: list[float] = []
     for i in range(n - 1):
         xi = points[i][1]
         yi = points[i][2]
@@ -751,9 +923,18 @@ def _robust_slopes_from_points(points: list[tuple[str, float, float]]) -> list[f
             if abs(dx) <= dx_floor:
                 continue
             s = (points[j][2] - yi) / dx
-            if math.isfinite(s) and -0.25 <= s <= 3.0:
-                slopes.append(float(s))
-    return slopes
+            if not (math.isfinite(s) and -0.25 <= s <= 3.0):
+                continue
+            slopes.append(float(s))
+            if use_decay and latest_mi is not None and month_idxs[j] is not None:
+                months_ago = max(0, latest_mi - month_idxs[j])
+                weights.append(math.exp(-TIME_DECAY_LAMBDA * months_ago))
+            elif use_decay:
+                weights.append(1.0)
+
+    if use_decay and len(weights) == len(slopes):
+        return slopes, weights
+    return slopes, None
 
 
 def _pass_through_from_records(
@@ -761,10 +942,10 @@ def _pass_through_from_records(
     source: str,
 ) -> dict[str, Any] | None:
     points = _history_xy_points(records)
-    slopes = _robust_slopes_from_points(points)
+    slopes, slope_weights = _robust_slopes_from_points(points)
     if not slopes:
         return None
-    raw = float(np.nanmedian(np.array(slopes, dtype=float)))
+    raw = _aggregate_slopes(slopes, slope_weights)
     coef = min(PASS_THROUGH_MAX, max(PASS_THROUGH_MIN, raw))
     spread = float(np.nanpercentile(slopes, 75) - np.nanpercentile(slopes, 25)) if len(slopes) >= 4 else 0.0
     return {
@@ -777,42 +958,107 @@ def _pass_through_from_records(
     }
 
 
+def _pool_slopes_from_history(
+    all_history: dict[str, list[dict]] | None,
+    *,
+    product_filter: Any | None = None,
+) -> tuple[list[float], list[float], int, int]:
+    """汇总斜率池；product_filter(pid)->bool，None 表示全部。"""
+    pooled: list[float] = []
+    pooled_w: list[float] = []
+    n_points = 0
+    n_products = 0
+    for pid, records in (all_history or {}).items():
+        if product_filter is not None and not product_filter(pid):
+            continue
+        pts = _history_xy_points(records)
+        if len(pts) < 2:
+            continue
+        n_products += 1
+        n_points += len(pts)
+        slopes, w = _robust_slopes_from_points(pts)
+        pooled.extend(slopes)
+        if w:
+            pooled_w.extend(w)
+        if len(pooled) >= 5000:
+            break
+    return pooled, pooled_w, n_points, n_products
+
+
+def _pass_through_from_pooled_slopes(
+    slopes: list[float],
+    slope_weights: list[float],
+    *,
+    source: str,
+    sample_count: int,
+    n_products: int,
+) -> dict[str, Any] | None:
+    if not slopes:
+        return None
+    w = slope_weights if len(slope_weights) == len(slopes) else None
+    raw = _aggregate_slopes(slopes, w)
+    coef = min(PASS_THROUGH_MAX, max(PASS_THROUGH_MIN, raw))
+    return {
+        "coefficient": coef,
+        "raw_coefficient": raw,
+        "source": source,
+        "sample_count": sample_count,
+        "slope_count": len(slopes),
+        "product_count": n_products,
+        "spread": (
+            float(np.nanpercentile(slopes, 75) - np.nanpercentile(slopes, 25))
+            if len(slopes) >= 4
+            else 0.0
+        ),
+    }
+
+
 def _estimate_pass_through(
     product: str,
     product_records: list[dict[str, Any]],
     all_history: dict[str, list[dict]] | None,
+    *,
+    product_categories: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     own = _pass_through_from_records(product_records, "本产品历史")
     if own is not None and own["slope_count"] >= 2:
         return own
 
-    global_slopes: list[float] = []
-    global_points = 0
-    for pid, records in (all_history or {}).items():
-        info = _pass_through_from_records(records, "全局产品历史")
-        if info is None:
-            continue
-        pts = _history_xy_points(records)
-        global_points += len(pts)
-        global_slopes.extend(_robust_slopes_from_points(pts))
-        if len(global_slopes) >= 5000:
-            break
+    cat = (product_categories or {}).get(product) if product_categories else None
+    if cat:
 
+        def _same_cat(pid: str) -> bool:
+            return pid != product and (product_categories or {}).get(pid) == cat
+
+        cat_slopes, cat_w, cat_pts, cat_prods = _pool_slopes_from_history(
+            all_history, product_filter=_same_cat
+        )
+        if (
+            len(cat_slopes) >= PASS_THROUGH_CATEGORY_MIN_SLOPES
+            or cat_prods >= PASS_THROUGH_CATEGORY_MIN_PRODUCTS
+        ):
+            info = _pass_through_from_pooled_slopes(
+                cat_slopes,
+                cat_w,
+                source="同分类产品历史",
+                sample_count=cat_pts,
+                n_products=cat_prods,
+            )
+            if info is not None:
+                info["category"] = cat
+                return info
+
+    global_slopes, global_w, global_points, global_prods = _pool_slopes_from_history(all_history)
     if global_slopes:
-        raw = float(np.nanmedian(np.array(global_slopes, dtype=float)))
-        coef = min(PASS_THROUGH_MAX, max(PASS_THROUGH_MIN, raw))
-        return {
-            "coefficient": coef,
-            "raw_coefficient": raw,
-            "source": "全局产品历史",
-            "sample_count": global_points,
-            "slope_count": len(global_slopes),
-            "spread": (
-                float(np.nanpercentile(global_slopes, 75) - np.nanpercentile(global_slopes, 25))
-                if len(global_slopes) >= 4
-                else 0.0
-            ),
-        }
+        info = _pass_through_from_pooled_slopes(
+            global_slopes,
+            global_w,
+            source="全局产品历史",
+            sample_count=global_points,
+            n_products=global_prods,
+        )
+        if info is not None:
+            return info
 
     return own
 
@@ -914,14 +1160,8 @@ def _extrapolation_risk(
 
     max_factor = max(factors) if factors else 1.0
     cap: float | None = None
-    if max_factor >= 10.0:
-        cap = 25.0
-    elif max_factor >= 5.0:
-        cap = 35.0
-    elif max_factor >= 2.0:
-        cap = 55.0
-    elif max_factor >= 1.5:
-        cap = 70.0
+    if max_factor > 1.5:
+        cap = max(20.0, 70.0 - 15.0 * (max_factor - 1.5))
 
     return {
         "max_factor": max_factor,
@@ -941,6 +1181,7 @@ def _predict_product_price_legacy(
     bom_rows: list[dict],
     prices_new: dict[str, float],
     prices_old: dict[str, float],
+    product_categories: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     返回预测产品总价、可信度 0–100、方法说明等。
@@ -1035,7 +1276,12 @@ def _predict_product_price_legacy(
                 candidates.append(("历史回归(元/KG)", pred_reg, w))
 
     # —— 方法 3：稳健成本传导（低波动时不依赖 R²）——
-    pass_info = _estimate_pass_through(product, hist_valid, product_cost_history)
+    pass_info = _estimate_pass_through(
+        product,
+        hist_valid,
+        product_cost_history,
+        product_categories=product_categories,
+    )
     pass_coef: float | None = None
     pred_pass_per_kg: float | None = None
     baseline_bom_per_kg: float | None = (
@@ -1067,7 +1313,12 @@ def _predict_product_price_legacy(
         if pred_pass_per_kg > 0:
             pred_pass = per_kg_to_product_total(pred_pass_per_kg, weight_kg)
             if pred_pass is not None and pred_pass > 0:
-                w = 0.98 if pass_info.get("source") == "本产品历史" else 0.9
+                src_pt = pass_info.get("source")
+                w = (
+                    0.98
+                    if src_pt == "本产品历史"
+                    else (0.92 if src_pt == "同分类产品历史" else 0.9)
+                )
                 candidates.append((f"成本传导({pass_info['source']})", pred_pass, w))
 
     # 选主预测：成本结构优先，其次成本传导；回归仅作参考诊断
@@ -1128,8 +1379,11 @@ def _predict_product_price_legacy(
 
     pass_score = 0.0
     if pass_info is not None:
-        if pass_info.get("source") == "本产品历史":
+        src = pass_info.get("source")
+        if src == "本产品历史":
             pass_score = min(16.0, 8.0 + min(8.0, float(pass_info.get("slope_count") or 0)))
+        elif src == "同分类产品历史":
+            pass_score = min(14.0, 7.0 + min(7.0, float(pass_info.get("slope_count") or 0) / 12.0))
         else:
             pass_score = min(12.0, 6.0 + min(6.0, float(pass_info.get("slope_count") or 0) / 10.0))
 
@@ -1495,17 +1749,42 @@ def _compute_historical_model_error(
         }
 
     df_err = pd.DataFrame(rows)
-    mat_series = df_err["材料成本"].dropna()
     outlier_months: set[str] = set()
-    if len(mat_series) >= 3:
-        mat_diff = mat_series.diff().dropna()
-        if len(mat_diff) >= 2:
-            diff_std = float(mat_diff.std())
+    if len(df_err) >= 3:
+
+        def _month_ord(qm: Any) -> int | None:
+            s = quote_month_key_scalar(qm)
+            if len(s) < 6:
+                return None
+            try:
+                return int(s[:4]) * 12 + int(s[4:6])
+            except ValueError:
+                return None
+
+        df_err = df_err.copy()
+        df_err["_mord"] = df_err["报价月份"].map(_month_ord)
+        df_err = df_err.sort_values("_mord")
+        mat_diffs: list[float] = []
+        diff_row_idx: list[Any] = []
+        prev_m: int | None = None
+        prev_mat: float | None = None
+        for idx, row in df_err.iterrows():
+            mord = row["_mord"]
+            mat_v = row["材料成本"]
+            if mord is None or mat_v is None or pd.isna(mat_v):
+                continue
+            if prev_m is not None and prev_mat is not None and mord - prev_m == 1:
+                mat_diffs.append(float(mat_v) - prev_mat)
+                diff_row_idx.append(idx)
+            prev_m = int(mord)
+            prev_mat = float(mat_v)
+        if len(mat_diffs) >= 2:
+            diff_std = float(np.std(mat_diffs))
             if diff_std > 1e-12:
                 threshold = 2.0 * diff_std
-                for idx, dmat in mat_diff.items():
-                    if abs(float(dmat)) > threshold:
-                        outlier_months.add(str(df_err.loc[idx, "报价月份"]))
+                for i, dmat in enumerate(mat_diffs):
+                    if abs(dmat) > threshold:
+                        outlier_months.add(str(df_err.loc[diff_row_idx[i], "报价月份"]))
 
     df_use = df_err[~df_err["报价月份"].astype(str).isin(outlier_months)]
     if len(df_use) < 2:
@@ -1597,7 +1876,7 @@ def _prepare_base_data(
     if price_df is None or price_df.empty:
         return None, "未上传产品价格历史清单，无法预测"
 
-    pid_str = norm_material_code(pd.Series([product_id])).iloc[0]
+    pid_str = norm_material_code_scalar(product_id)
 
     # ── 价格历史 ──────────────────────────────────────────────────────────
     price_pid_col = "产品编码" if "产品编码" in price_df.columns else (
@@ -1768,11 +2047,11 @@ def _estimate_conduction_coeff(base_data: dict) -> "tuple[float, str]":
         for _, r in merged.iterrows()
         if float(r["BOM批次合计"]) > 1e-12 and float(r["材料成本"]) > 1e-12
     ]
-    slopes = _robust_slopes_from_points(points)
+    slopes, slope_weights = _robust_slopes_from_points(points)
     if len(slopes) < 2:
         return fallback, "global_fallback"
 
-    coeff = float(np.nanmedian(np.array(slopes, dtype=float)))
+    coeff = _aggregate_slopes(slopes, slope_weights)
     if len(slopes) >= 5:
         lo, hi = np.nanpercentile(slopes, [5, 95])
         lo = max(abs_min, float(lo))

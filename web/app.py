@@ -103,9 +103,11 @@ if str(_ROOT_PROJ) not in sys.path:
 from bom_date_key import calendar_date_key_yyyymmdd as _calendar_date_key_yyyymmdd
 
 from cost_sim_predict import (
+    build_product_category_index,
     build_product_cost_history,
     build_product_price_timeline,
     expand_product_cost_history_dict,
+    normalize_predict_dataframes,
     normalize_price_list_cost_fields,
     predict_product_price,
     _predict_product_price_legacy,
@@ -698,7 +700,8 @@ def _read_price_df(price_fp: "Path | None") -> "pd.DataFrame | None":
                 if alias in df.columns:
                     df = df.rename(columns={alias: "总成本"})
                     break
-        return df
+        _, df_norm = normalize_predict_dataframes(None, df)
+        return df_norm
     except Exception:
         return None
 
@@ -712,6 +715,7 @@ def _fill_bi_cache(
     product_price_timeline: dict | None = None,
     bom_pd: "pd.DataFrame | None" = None,
     price_pd: "pd.DataFrame | None" = None,
+    product_categories: dict | None = None,
 ) -> None:
     """把分析管道已算好的 BI 表直接写入内存缓存，供 BI 接口秒返回。"""
     summary_pd = summary_pl.to_pandas()
@@ -756,6 +760,7 @@ def _fill_bi_cache(
         "product_cost_history": pch,
         "bom_pd":               bom_pd,
         "price_pd":             price_pd,
+        "product_categories":   product_categories or {},
         "ts":                   time.time(),
     }
     _bi_cache_put(token, entry)
@@ -815,6 +820,10 @@ def process():
         except Exception:
             bom_pd_raw = None
         price_pd_raw = _read_price_df(price_fp)
+        bom_pd_raw, price_pd_raw = normalize_predict_dataframes(bom_pd_raw, price_pd_raw)
+        product_categories = (
+            build_product_category_index(bom_pd_raw) if bom_pd_raw is not None else {}
+        )
 
         # ── 合并模式 ──────────────────────────────────────────────────────
         if mode == "merge":
@@ -832,6 +841,7 @@ def process():
                 ppt,
                 bom_pd=bom_pd_raw,
                 price_pd=price_pd_raw,
+                product_categories=product_categories,
             )
 
             _cleanup_inputs()
@@ -861,6 +871,10 @@ def process():
                     bom_pd_item: pd.DataFrame | None = normalize_columns(raw_df_item).to_pandas()
                 except Exception:
                     bom_pd_item = None
+                bom_pd_item, _ = normalize_predict_dataframes(bom_pd_item, None)
+                product_categories_item = (
+                    build_product_category_index(bom_pd_item) if bom_pd_item is not None else {}
+                )
                 if has_price and price_fp is not None:
                     raw_df_item = _attach_product_prices_pl(raw_df_item, price_fp)
                 lines, summary_pl, detail_pl, price_history_pl, pch, _ = _run_pipeline(raw_df_item, out_path)
@@ -873,6 +887,7 @@ def process():
                     ppt,
                     bom_pd=bom_pd_item,
                     price_pd=price_pd_raw,
+                    product_categories=product_categories_item,
                 )
                 total_rows += lines.height
                 tokens.append({
@@ -1361,6 +1376,7 @@ def bi_product_bom(session_id: str):
             bom_rows=rows,
             prices_new=prices_old,
             prices_old=prices_old,
+            product_categories=cache.get("product_categories"),
         )
 
     lines_out = [_json_clean_row(row) for row in lines]
@@ -1453,6 +1469,7 @@ def _simulate_product_cost(
             bom_rows=rows,
             prices_new={c: prices.get(c, prices_old[c]) for c in prices_old},
             prices_old=prices_old,
+            product_categories=cache.get("product_categories"),
         )
 
     ref_total = price_snap.get("总成本")

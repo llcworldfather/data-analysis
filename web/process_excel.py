@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from typing import Any
 from datetime import datetime
 from pathlib import Path
 
@@ -70,10 +71,21 @@ def normalize_columns(df: pl.DataFrame) -> pl.DataFrame:
     return df.rename(renames) if renames else df
 
 
+def norm_material_code_scalar(code: Any) -> str:
+    """单值物料编码规范化（与 norm_material_code 列处理规则一致）。"""
+    if code is None:
+        return ""
+    s = str(code).strip()
+    if re.match(r"^-?\d+\.0+$", s):
+        s = s.split(".")[0]
+    if s in ("nan", "None", "<NA>"):
+        return ""
+    return s
+
+
 def norm_material_code(series: pd.Series) -> pd.Series:
     """统一物料编码为字符串：去空白、去掉 Excel 浮点尾缀 .0。"""
-    x = series.astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
-    return x.replace({"nan": "", "None": "", "<NA>": ""})
+    return series.map(norm_material_code_scalar)
 
 
 # ---------------------------------------------------------------------------
