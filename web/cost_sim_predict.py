@@ -1350,15 +1350,18 @@ def _compute_sensitivity_analysis(
 
     base_bom_total = float(base_data.get("base_bom_total") or 0.0)
     base_mat = base_data.get("base_mat")
+    sim_bom_center = _sim_bom_from_component_info(component_info)
+    ratio_base = sim_bom_center if sim_bom_center > 1e-12 else base_bom_total
+
     denom_ppk = float(point_per_kg) if point_per_kg and point_per_kg > 1e-12 else None
     if denom_ppk is None:
-        bom_center = _sim_bom_from_component_info(component_info)
         denom_ppk = _point_per_kg_from_sim_bom(
-            bom_center,
+            sim_bom_center,
             has_cost_structure=has_cost_structure,
             base_data=base_data,
             coeff=coeff,
             base_for_coeff=base_for_coeff,
+            base_bom_total_override=sim_bom_center,
         )
     if denom_ppk is None or denom_ppk <= 1e-12:
         return []
@@ -1380,12 +1383,20 @@ def _compute_sensitivity_analysis(
         bom_hi = _sim_bom_from_component_info(info_hi)
 
         ppk_lo = _point_per_kg_from_sim_bom(
-            bom_lo, has_cost_structure=has_cost_structure, base_data=base_data,
-            coeff=coeff, base_for_coeff=base_for_coeff,
+            bom_lo,
+            has_cost_structure=has_cost_structure,
+            base_data=base_data,
+            coeff=coeff,
+            base_for_coeff=base_for_coeff,
+            base_bom_total_override=sim_bom_center,
         )
         ppk_hi = _point_per_kg_from_sim_bom(
-            bom_hi, has_cost_structure=has_cost_structure, base_data=base_data,
-            coeff=coeff, base_for_coeff=base_for_coeff,
+            bom_hi,
+            has_cost_structure=has_cost_structure,
+            base_data=base_data,
+            coeff=coeff,
+            base_for_coeff=base_for_coeff,
+            base_bom_total_override=sim_bom_center,
         )
         if ppk_lo is None or ppk_hi is None:
             continue
@@ -1395,11 +1406,11 @@ def _compute_sensitivity_analysis(
             has_cost_structure
             and base_mat is not None
             and not math.isnan(base_mat)
-            and base_bom_total > 1e-12
+            and ratio_base > 1e-12
         ):
             d_bom_half = quantity * user_price * pct
             mat_for_ratio = base_data.get("base_mat_piece") or base_mat
-            half_delta_piece = float(mat_for_ratio) * d_bom_half / base_bom_total
+            half_delta_piece = float(mat_for_ratio) * d_bom_half / ratio_base
             wt = base_data.get("weight")
             if base_data.get("costs_are_per_piece") and wt and not math.isnan(wt) and wt > 0:
                 half_delta_ppk = half_delta_piece / float(wt)

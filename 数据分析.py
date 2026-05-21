@@ -14,6 +14,7 @@ plt.rcParams["axes.unicode_minus"] = False
 # 每产品最多用多少个「单价有波动」的列。不是越大越好：行数很少时特征多了会过拟合/不可辨识；
 # 取方差最大的若干列是在「信息量」和「速度/稳定性」之间的折中。
 MAX_FEATURES_PER_PRODUCT = 60
+RIDGE_ALPHA = 1e-2
 
 
 def _pick_zmatnr_for_plot(final_df: pd.DataFrame, k: int = 3) -> np.ndarray:
@@ -37,7 +38,14 @@ def _pick_zmatnr_for_plot(final_df: pd.DataFrame, k: int = 3) -> np.ndarray:
     rest = [m for m in mats if m not in picked]
     if rest:
         med = float(agg["mean"].median())
-        i_third = max(rest, key=lambda m: abs(float(agg.loc[m, "mean"]) - med))
+
+        def _dist_from_median(m):
+            v = agg.loc[m, "mean"]
+            if pd.isna(v):
+                return 0.0
+            return abs(float(v) - med)
+
+        i_third = max(rest, key=_dist_from_median)
         picked.append(i_third)
 
     out = []
@@ -57,10 +65,12 @@ def _pick_zmatnr_for_plot(final_df: pd.DataFrame, k: int = 3) -> np.ndarray:
 def _lstsq_predict_one_product(
     y: np.ndarray,
     X: np.ndarray,
+    *,
+    ridge_alpha: float = RIDGE_ALPHA,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     y: (n,), X: (n, p) 已含常数列在第一列。
-    返回 (全样本预测, beta) beta 长度为 p；失败时预测为有效样本的均值，beta 为 None。
+    岭回归缓解小样本过拟合（截距不正则化）。返回 (全样本预测, beta)；失败时用有效样本均值。
     """
     n, p = X.shape
     valid = np.isfinite(X).all(axis=1) & np.isfinite(y)
@@ -68,14 +78,19 @@ def _lstsq_predict_one_product(
     fill = float(np.nanmean(y[valid])) if nv else np.nan
     pred = np.full(n, fill, dtype=float)
 
-    if nv < p + 1:
+    if nv < 3:
         return pred, None
 
     Xv, yv = X[valid], y[valid]
     try:
-        beta, _, _, _ = np.linalg.lstsq(Xv, yv, rcond=None)
-        pred = X @ beta
-        return pred.astype(float, copy=False), beta
+        if ridge_alpha > 0 and p > 1:
+            reg = np.eye(p, dtype=np.float64) * float(ridge_alpha)
+            reg[0, 0] = 0.0
+            beta = np.linalg.solve(Xv.T @ Xv + reg, Xv.T @ yv)
+        else:
+            beta, _, _, _ = np.linalg.lstsq(Xv, yv, rcond=None)
+        pred = (X @ beta).astype(float, copy=False)
+        return pred, beta.astype(float, copy=False)
     except Exception:
         return pred, None
 
@@ -93,11 +108,15 @@ def process_price_analysis(file_path):
 
     # 2. 透视：组件单价（列 = MAKTX）
     print("2/5 正在生成透视表...", flush=True)
+    # 同一 (产品, 日期, MAKTX) 多行时取最后一条报价，避免默认 mean 把同日多行混成均值
     pivot_df = df.pivot_table(
-        index=["CREATEDATE", "ZMATNR"], columns="MAKTX", values="ZDJ"
+        index=["CREATEDATE", "ZMATNR"],
+        columns="MAKTX",
+        values="ZDJ",
+        aggfunc="last",
     ).reset_index()
 
-    pivot_df = pivot_df.sort_values(["ZMATNR", "CREATEDATE"]).reset_index(drop=True)
+    pivot_df = pivot_df.sort_values(["ZMATNR", "CREATEDATE"])
     price_cols = [c for c in pivot_df.columns if c not in ("CREATEDATE", "ZMATNR")]
     print(
         f"3/5 按产品填充缺失单价（{len(price_cols)} 列 × {len(pivot_df)} 行，使用向量化 groupby 填充）...",
@@ -106,8 +125,6 @@ def process_price_analysis(file_path):
     if price_cols:
         pivot_df[price_cols] = pivot_df.groupby("ZMATNR", sort=False)[price_cols].ffill()
         pivot_df[price_cols] = pivot_df.groupby("ZMATNR", sort=False)[price_cols].bfill()
-
-    pivot_df = pivot_df.reset_index(drop=True)
 
     df = df.assign(_line=df["ZDJ"] * df["MENGE"])
     costs = (
@@ -164,8 +181,10 @@ def process_price_analysis(file_path):
         yg = y_s[s:e]
         matnr = z[s]
 
-        col_var = np.nanvar(Xg, axis=0)
-        use_idx = np.flatnonzero(np.isfinite(col_var) & (col_var > 1e-14))
+        col_var = np.nanvar(Xg, axis=0, ddof=0)
+        col_mean = np.nanmean(np.abs(Xg), axis=0)
+        var_floor = np.maximum(1e-6, col_mean * 1e-5)
+        use_idx = np.flatnonzero(np.isfinite(col_var) & (col_var > var_floor))
         if use_idx.size == 0:
             pred_s[s:e] = float(np.nanmean(yg))
             continue
@@ -254,19 +273,30 @@ def process_price_analysis(file_path):
         print(f"绘图出错: {e}")
 
     global_model = None
-    if len(X_columns) <= 120:
+    ref_X = final_df[X_columns].to_numpy(dtype=np.float64, copy=False)
+    ref_var = np.nanvar(ref_X, axis=0, ddof=0)
+    ref_mean = np.nanmean(np.abs(ref_X), axis=0)
+    ref_floor = np.maximum(1e-6, ref_mean * 1e-5)
+    ref_idx = np.flatnonzero(np.isfinite(ref_var) & (ref_var > ref_floor))
+    if ref_idx.size > MAX_FEATURES_PER_PRODUCT:
+        ref_sub = ref_idx[np.argsort(ref_var[ref_idx])[-MAX_FEATURES_PER_PRODUCT:]]
+    else:
+        ref_sub = ref_idx
+    ref_cols = [X_columns[int(j)] for j in ref_sub]
+    if len(ref_cols) >= 2 and len(final_df) >= len(ref_cols) + 1:
         try:
-            X_all = sm.add_constant(final_df[X_columns].fillna(0))
+            X_all = sm.add_constant(final_df[ref_cols].fillna(0))
             y_all = final_df["Total_Cost"]
             mask = X_all.notna().all(axis=1) & y_all.notna()
             global_model = sm.OLS(y_all[mask], X_all[mask], missing="drop").fit()
+            print(
+                f"   全样本参考回归：方差 Top {len(ref_cols)} 列（全表共 {len(X_columns)} 列）",
+                flush=True,
+            )
         except Exception as e:
             print(f"全样本参考回归未拟合（可忽略）: {e}")
     else:
-        print(
-            f"   全样本参考回归已跳过（组件列数 {len(X_columns)} 过大，避免长时间占用）",
-            flush=True,
-        )
+        print("   全样本参考回归已跳过（有效特征或样本不足）", flush=True)
 
     return global_model, coef_df
 
