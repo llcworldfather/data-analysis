@@ -15,7 +15,7 @@ WEB = ROOT / "web"
 sys.path.insert(0, str(WEB))
 sys.path.insert(0, str(ROOT))
 
-from process_excel import normalize_columns  # noqa: E402
+from process_excel import norm_material_code, normalize_columns  # noqa: E402
 from cost_sim_predict import (  # noqa: E402
     build_product_cost_history,
     build_product_price_timeline,
@@ -30,12 +30,7 @@ OUT = ROOT / "output" / "regression_eligibility_report.txt"
 
 
 def _norm_codes(s: pd.Series) -> pd.Series:
-    return (
-        s.astype(str)
-        .str.strip()
-        .str.replace(r"\.0+$", "", regex=True)
-        .replace({"nan": "", "None": ""})
-    )
+    return norm_material_code(s)
 
 
 def main() -> None:

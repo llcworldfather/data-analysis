@@ -30,23 +30,29 @@ from bom_date_key import calendar_date_key_yyyymmdd
 OUTPUT_DIR = ROOT / "output"
 
 MAX_FEATURES_PER_PRODUCT = 60
+RIDGE_ALPHA = 1e-2
 
 
 def _lstsq_predict_one_product(
-    y: np.ndarray, X: np.ndarray
+    y: np.ndarray, X: np.ndarray, *, ridge_alpha: float = RIDGE_ALPHA
 ) -> Tuple[np.ndarray, Optional[np.ndarray], float]:
-    """X 第一列为常数项。返回 (预测, beta, r2_in_sample)。"""
+    """X 第一列为常数项；岭回归缓解小样本过拟合。返回 (预测, beta, r2_in_sample)。"""
     n, p = X.shape
     valid = np.isfinite(X).all(axis=1) & np.isfinite(y)
     nv = int(valid.sum())
     fill = float(np.nanmean(y[valid])) if nv else np.nan
     pred = np.full(n, fill, dtype=float)
-    if nv < p + 1:
+    if nv < 2:
         return pred, None, float("nan")
 
     Xv, yv = X[valid], y[valid]
     try:
-        beta, _, _, _ = np.linalg.lstsq(Xv, yv, rcond=None)
+        if ridge_alpha > 0 and p > 1:
+            reg = np.eye(p, dtype=np.float64) * float(ridge_alpha)
+            reg[0, 0] = 0.0
+            beta = np.linalg.solve(Xv.T @ Xv + reg, Xv.T @ yv)
+        else:
+            beta, _, _, _ = np.linalg.lstsq(Xv, yv, rcond=None)
         pred = (X @ beta).astype(float, copy=False)
         resid = yv - Xv @ beta
         ss_res = float(np.dot(resid, resid))
@@ -187,7 +193,9 @@ def run(
         X_columns = [str(c) for c in pv2.columns]
 
         col_var = np.nanvar(Xg, axis=0, ddof=0)
-        use_idx = np.flatnonzero(np.isfinite(col_var) & (col_var > 1e-14))
+        col_mean = np.nanmean(np.abs(Xg), axis=0)
+        var_floor = np.maximum(1e-6, col_mean * 1e-5)
+        use_idx = np.flatnonzero(np.isfinite(col_var) & (col_var > var_floor))
         if use_idx.size == 0:
             r2_list.append((matnr, n_common, float("nan")))
             fill = float(np.nanmean(yg))

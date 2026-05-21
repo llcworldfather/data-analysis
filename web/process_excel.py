@@ -70,6 +70,12 @@ def normalize_columns(df: pl.DataFrame) -> pl.DataFrame:
     return df.rename(renames) if renames else df
 
 
+def norm_material_code(series: pd.Series) -> pd.Series:
+    """统一物料编码为字符串：去空白、去掉 Excel 浮点尾缀 .0。"""
+    x = series.astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
+    return x.replace({"nan": "", "None": "", "<NA>": ""})
+
+
 # ---------------------------------------------------------------------------
 # I/O
 # ---------------------------------------------------------------------------

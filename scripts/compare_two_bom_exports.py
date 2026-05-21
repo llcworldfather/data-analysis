@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "web"))
 sys.path.insert(0, str(ROOT))
 
-from process_excel import normalize_columns
+from process_excel import norm_material_code, normalize_columns
 from cost_sim_predict import (
     build_product_cost_history,
     build_product_price_timeline,
@@ -104,9 +104,7 @@ def score_bom(bom_path: Path, pid: str, price: pd.DataFrame, ppt) -> dict:
 
 def main():
     price = pd.read_excel(DATA / "产品价格历史清单.xls")
-    price["产品编码"] = (
-        price["产品编码"].astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
-    )
+    price["产品编码"] = norm_material_code(price["产品编码"])
     ppt = build_product_price_timeline(DATA / "产品价格历史清单.xls")
 
     new_path = DATA / "报价BOM历史清单_由25年BOM(1)导出.xlsx"

@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "web"))
 sys.path.insert(0, str(ROOT))
 
-from process_excel import normalize_columns
+from process_excel import norm_material_code, normalize_columns
 from cost_sim_predict import (
     build_product_cost_history,
     build_product_price_timeline,
@@ -25,12 +25,7 @@ DATA = Path(r"C:\Users\00109151\Desktop\数据集")
 
 
 def norm(s):
-    return (
-        s.astype(str)
-        .str.strip()
-        .str.replace(r"\.0+$", "", regex=True)
-        .replace({"nan": "", "None": ""})
-    )
+    return norm_material_code(s)
 
 
 def score_pid(pid, bom_raw, expanded, pch, price_periods):

@@ -23,6 +23,7 @@ from process_excel import (
     COL_PRODUCT,
     COL_QTY,
     COL_UNIT_PRICE,
+    norm_material_code,
     normalize_columns,
 )
 
@@ -35,14 +36,23 @@ _DATE_ALIASES = ("创建日期", "生价日期", "CREATEDATE", "生产日期", "
 
 
 def _norm_code_series(s: pd.Series) -> pd.Series:
-    x = s.astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
-    return x.replace({"nan": "", "None": "", "<NA>": ""})
+    return norm_material_code(s)
+
+
+def _timeline_month_key(dk: Any) -> str:
+    """BOM 日键 YYYYMMDD 与价格时间线 YYYYMM 对齐到月份。"""
+    s = str(dk).strip()
+    if not s or s in ("nan", "None", "snapshot"):
+        return s
+    digits = re.sub(r"\D", "", s)
+    if len(digits) >= 6:
+        return digits[:6]
+    return s
 
 
 def quote_month_key_from_series(s: pd.Series) -> pd.Series:
     """将「报价月份」或日期列规范为 YYYYMM（如 202512）。"""
-    raw = s.astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
-    raw = raw.replace({"nan": "", "None": "", "<NA>": ""})
+    raw = norm_material_code(s)
 
     def _one(v: str) -> str:
         if not v:
@@ -350,38 +360,65 @@ def build_product_cost_history(raw_pl: pl.DataFrame) -> dict[str, list[dict[str,
     mat_cost_col = "材料成本" if "材料成本" in raw.columns else None
     labor_col = "工费" if "工费" in raw.columns else None
 
+    quote_col = next(
+        (c for c in ("报价号", "ZBJNO", "报价流水号", "ZSNO") if c in raw.columns),
+        None,
+    )
+    if quote_col:
+        raw["_qv"] = _norm_code_series(raw[quote_col]).replace("", pd.NA)
+    else:
+        raw["_qv"] = pd.NA
+
+    # 先按 (产品, 报价版本, 日) 汇总单版本成本，再对同日多版本取均值
+    version_daily = (
+        raw.groupby([COL_PRODUCT, "_qv", "_dk"], sort=False, dropna=False)["_line"]
+        .sum()
+        .reset_index()
+    )
+    bom_by_day = (
+        version_daily.groupby([COL_PRODUCT, "_dk"], sort=False)["_line"]
+        .mean()
+        .reset_index()
+    )
+    meta_by_day = raw.groupby([COL_PRODUCT, "_dk"], sort=False).last().reset_index()
+
     out: dict[str, list[dict[str, Any]]] = {}
-    group_cols = [COL_PRODUCT, "_dk"]
-    for keys, grp in raw.groupby(group_cols, sort=False):
-        pid = str(keys[0] if isinstance(keys, tuple) else keys).strip()
-        dk = keys[1] if isinstance(keys, tuple) else "snapshot"
-        bom_material = float(grp["_line"].sum())
+    for _, bom_row in bom_by_day.iterrows():
+        pid = str(bom_row[COL_PRODUCT]).strip()
+        dk = bom_row["_dk"]
+        bom_material = float(bom_row["_line"])
         if bom_material <= 1e-12:
             continue
+
+        meta = meta_by_day[
+            (meta_by_day[COL_PRODUCT] == bom_row[COL_PRODUCT])
+            & (meta_by_day["_dk"] == dk)
+        ]
+        grp = meta.iloc[-1:] if len(meta) else pd.DataFrame()
 
         row: dict[str, Any] = {
             "date": str(dk) if pd.notna(dk) else "snapshot",
             "bom_material": round(bom_material, 6),
         }
         wt_kg: float | None = None
-        if "重量" in grp.columns:
+        if len(grp) and "重量" in grp.columns:
             wts = pd.to_numeric(grp["重量"], errors="coerce").dropna()
             if len(wts):
                 wt_kg = float(wts.iloc[-1])
 
         pp_per_kg: float | None = None
-        if product_price_col:
+        if product_price_col and len(grp):
             pp = pd.to_numeric(grp[product_price_col], errors="coerce").dropna()
             if len(pp):
                 pp_per_kg = float(pp.iloc[-1])
         mat_per_kg: float | None = None
         labor_per_kg: float | None = None
-        if mat_cost_col:
+        if mat_cost_col and len(grp):
             mc = pd.to_numeric(grp[mat_cost_col], errors="coerce").dropna()
             if len(mc):
                 mat_per_kg = float(mc.iloc[-1])
                 row["材料成本_per_kg"] = round(mat_per_kg, 6)
-        if labor_col:
+        if labor_col and len(grp):
             lb = pd.to_numeric(grp[labor_col], errors="coerce").dropna()
             if len(lb):
                 labor_per_kg = float(lb.iloc[-1])
@@ -542,33 +579,40 @@ def expand_product_cost_history_dict(
             menges[c] = float(r.get("MENGE合计") or 0)
             defaults[c] = float(r.get("组件单价") or 0)
 
-        existing = {str(h.get("date")): h for h in out.get(product, [])}
-        pp_tl = ppt.get(product, {})
+        existing = {
+            _timeline_month_key(str(h.get("date"))): h for h in out.get(product, [])
+        }
+        pp_tl = {
+            _timeline_month_key(k): v for k, v in (ppt.get(product, {}) or {}).items()
+        }
 
         dates: set[str] = set(existing.keys()) | set(pp_tl.keys())
         for c in menges:
             if c in comp_panels:
-                dates.update(comp_panels[c].keys())
+                for dk in comp_panels[c]:
+                    mk = _timeline_month_key(dk)
+                    if mk:
+                        dates.add(mk)
         if not dates:
             continue
 
         expanded_rows: list[dict[str, Any]] = []
-        for dk in sorted(dates):
-            if dk in ("", "nan", "None"):
+        for mk in sorted(dates):
+            if mk in ("", "nan", "None"):
                 continue
             bom_material = 0.0
             for c, m in menges.items():
                 if m <= 0:
                     continue
-                p = _price_at_date(comp_panels.get(c, {}), dk, defaults.get(c, 0.0))
+                p = _price_at_date(comp_panels.get(c, {}), mk, defaults.get(c, 0.0))
                 bom_material += m * p
             if bom_material <= 1e-12:
                 continue
 
             pp_kg: float | None = None
             wt_slot: float | None = None
-            if dk in pp_tl:
-                slot = pp_tl[dk]
+            if mk in pp_tl:
+                slot = pp_tl[mk]
                 wt_slot = slot.get("重量")
                 if slot.get("product_price_per_kg") is not None:
                     pp_kg = float(slot["product_price_per_kg"])
@@ -578,8 +622,8 @@ def expand_product_cost_history_dict(
                         pp_kg = float(pp_total) / float(wt_slot)
                     elif pp_total is not None:
                         pp_kg = float(pp_total)
-            elif dk in existing:
-                ex = existing[dk]
+            elif mk in existing:
+                ex = existing[mk]
                 wt_slot = _weight_kg_from_row(ex)
                 _, pp_kg = history_per_kg_pair(ex)
 
@@ -591,36 +635,36 @@ def expand_product_cost_history_dict(
             bom_per_kg = bom_material / wt_f
 
             row: dict[str, Any] = {
-                "date": dk,
+                "date": mk,
                 "bom_material": round(bom_material, 6),
                 "bom_material_per_kg": round(bom_per_kg, 6),
                 "product_price_per_kg": round(pp_kg, 6),
                 "product_price": round(per_kg_to_product_total(pp_kg, wt_f) or pp_kg, 6),
                 "重量_kg": round(wt_f, 6),
-                "_from_trend": dk not in existing,
+                "_from_trend": mk not in existing,
             }
-            if dk in pp_tl:
-                slot = pp_tl[dk]
+            if mk in pp_tl:
+                slot = pp_tl[mk]
                 if "材料成本" in slot:
                     row["材料成本_per_kg"] = slot["材料成本"]
                 if "工费" in slot:
                     row["工费_per_kg"] = slot["工费"]
             expanded_rows.append(row)
 
-        # 同日优先保留 BOM 原始快照（非趋势合成）
-        by_date: dict[str, dict[str, Any]] = {}
+        # 按月优先保留 BOM 原始快照（非趋势合成）
+        by_month: dict[str, dict[str, Any]] = {}
         for r in expanded_rows:
-            d = str(r["date"])
-            prev = by_date.get(d)
+            m = _timeline_month_key(str(r["date"]))
+            prev = by_month.get(m)
             if prev is None or (prev.get("_from_trend") and not r.get("_from_trend")):
-                by_date[d] = r
+                by_month[m] = r
             elif prev.get("_from_trend") and r.get("_from_trend"):
-                by_date[d] = r
-        for d, h in existing.items():
-            if d not in by_date and h.get("product_price") is not None:
-                by_date[d] = h
+                by_month[m] = r
+        for m, h in existing.items():
+            if m not in by_month and h.get("product_price") is not None:
+                by_month[m] = {**h, "date": m}
 
-        merged = sorted(by_date.values(), key=lambda x: str(x.get("date") or ""))
+        merged = sorted(by_month.values(), key=lambda x: str(x.get("date") or ""))
         if merged:
             out[product] = merged
 
@@ -1244,9 +1288,14 @@ def _point_per_kg_from_sim_bom(
     base_data: dict,
     coeff: float = 0.030,
     base_for_coeff: float | None = None,
+    base_bom_total_override: float | None = None,
 ) -> float | None:
     """由 BOM 批次合计推算产品价（元/kg）。"""
-    base_bom_total = base_data.get("base_bom_total") or 0.0
+    base_bom_total = (
+        float(base_bom_total_override)
+        if base_bom_total_override is not None
+        else float(base_data.get("base_bom_total") or 0.0)
+    )
     if has_cost_structure and base_bom_total > 1e-12:
         base_mat = base_data.get("base_mat_piece") or base_data["base_mat"]
         base_labor = base_data.get("base_labor_piece") or base_data["base_labor"]
@@ -1414,6 +1463,7 @@ def _compute_historical_model_error(
             base_data=base_data,
             coeff=coeff,
             base_for_coeff=base_for_coeff,
+            base_bom_total_override=bom_t,
         )
         if pred is None:
             continue
@@ -1536,12 +1586,7 @@ def _prepare_base_data(
     if price_df is None or price_df.empty:
         return None, "未上传产品价格历史清单，无法预测"
 
-    def _norm_code(s: pd.Series) -> pd.Series:
-        return s.astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
-
-    pid_str = str(product_id).strip().rstrip("0").rstrip(".") if "." in str(product_id) else str(product_id).strip()
-    # 更稳健的 pid 规范化
-    pid_str = _norm_code(pd.Series([product_id])).iloc[0]
+    pid_str = norm_material_code(pd.Series([product_id])).iloc[0]
 
     # ── 价格历史 ──────────────────────────────────────────────────────────
     price_pid_col = "产品编码" if "产品编码" in price_df.columns else (
@@ -1550,12 +1595,12 @@ def _prepare_base_data(
     if price_pid_col is None:
         return None, "价格历史缺少产品编码列"
 
-    p_hist = price_df[_norm_code(price_df[price_pid_col]) == pid_str].copy()
+    p_hist = price_df[norm_material_code(price_df[price_pid_col]) == pid_str].copy()
 
     if "报价月份" not in p_hist.columns:
         return None, "价格历史缺少「报价月份」列"
 
-    p_hist["_qm"] = _norm_code(p_hist["报价月份"]).str[:6]
+    p_hist["_qm"] = norm_material_code(p_hist["报价月份"]).str[:6]
     p_hist = p_hist.sort_values("_qm").drop_duplicates("_qm", keep="last")
 
     if p_hist.empty:
@@ -1567,7 +1612,7 @@ def _prepare_base_data(
     if bom_df is None or bom_df.empty or COL_PRODUCT not in bom_df.columns:
         return None, "BOM历史数据不可用"
 
-    b_hist = bom_df[_norm_code(bom_df[COL_PRODUCT]) == pid_str].copy()
+    b_hist = bom_df[norm_material_code(bom_df[COL_PRODUCT]) == pid_str].copy()
 
     if b_hist.empty:
         return None, "BOM历史中无该产品记录"
@@ -1577,7 +1622,7 @@ def _prepare_base_data(
 
     # 规范化日期列为 8 位字符串
     if COL_CREATEDATE in b_hist.columns:
-        b_hist["_date"] = _norm_code(b_hist[COL_CREATEDATE]).str[:8]
+        b_hist["_date"] = norm_material_code(b_hist[COL_CREATEDATE]).str[:8]
     else:
         b_hist["_date"] = "00000000"
 
@@ -1594,7 +1639,7 @@ def _prepare_base_data(
         历史最低="min",
         历史最高="max",
     ).reset_index().rename(columns={COL_COMPONENT: "材料编码", maktx_col: "材料型号"})
-    comp_stats["材料编码"] = _norm_code(comp_stats["材料编码"])
+    comp_stats["材料编码"] = norm_material_code(comp_stats["材料编码"])
     comp_stats["历史std"] = comp_stats["历史std"].fillna(comp_stats["历史均价"] * 0.05)
 
     # ── 历史BOM合计月度序列 ───────────────────────────────────────────────
@@ -1609,7 +1654,7 @@ def _prepare_base_data(
     bom_monthly = bom_daily.groupby("报价月份")["BOM批次合计"].mean().reset_index()
 
     # ── 基准BOM合计（最新期：用量 × 当前 BOM 单价，与页面「加载 BOM」一致）──
-    lb_comp = _norm_code(latest_bom_raw[COL_COMPONENT])
+    lb_comp = norm_material_code(latest_bom_raw[COL_COMPONENT])
     lb_qty = latest_bom_raw[COL_QTY].values
     lb_unit_prices = pd.to_numeric(
         latest_bom_raw[COL_UNIT_PRICE], errors="coerce"
@@ -1618,7 +1663,7 @@ def _prepare_base_data(
 
     # ── 构建标准化的 latest_bom DataFrame ────────────────────────────────
     latest_bom = latest_bom_raw[[COL_COMPONENT, maktx_col, COL_QTY, COL_UNIT_PRICE]].copy()
-    latest_bom["材料编码"] = _norm_code(latest_bom[COL_COMPONENT])
+    latest_bom["材料编码"] = norm_material_code(latest_bom[COL_COMPONENT])
     latest_bom = latest_bom.rename(columns={
         maktx_col: "材料型号",
         COL_QTY: "组件数量",
@@ -1687,35 +1732,45 @@ def _prepare_base_data(
 def _estimate_conduction_coeff(base_data: dict) -> "tuple[float, str]":
     """
     用历史月度数据估计：产品材料成本 随 BOM批次合计 的变化率。
+    复用 Theil-Sen 风格稳健斜率（_robust_slopes_from_points），系数区间随样本自适应。
     返回 (稳健传导系数, 样本质量评级)。
     """
+    fallback = 0.030
+    abs_min, abs_max = 0.005, 0.15
+
     bom_m = base_data["bom_monthly"]
     p_h = base_data["p_hist"]
 
     merged = bom_m.merge(p_h[["报价月份", "材料成本"]], on="报价月份", how="inner")
-
-    if len(merged) < 3 or merged["材料成本"].isna().all():
-        return 0.030, "global_fallback"
-
     merged = merged.dropna(subset=["材料成本", "BOM批次合计"])
+    merged = merged.sort_values("报价月份")
+
     if len(merged) < 3:
-        return 0.030, "global_fallback"
+        return fallback, "global_fallback"
 
-    delta_mat = merged["材料成本"].diff().dropna()
-    delta_bom = merged["BOM批次合计"].diff().dropna()
+    points = [
+        (
+            str(r["报价月份"]),
+            float(r["BOM批次合计"]),
+            float(r["材料成本"]),
+        )
+        for _, r in merged.iterrows()
+        if float(r["BOM批次合计"]) > 1e-12 and float(r["材料成本"]) > 1e-12
+    ]
+    slopes = _robust_slopes_from_points(points)
+    if len(slopes) < 2:
+        return fallback, "global_fallback"
 
-    valid = delta_bom.abs() > 0.5
-    ratios = (delta_mat[valid] / delta_bom[valid]).dropna()
+    coeff = float(np.nanmedian(np.array(slopes, dtype=float)))
+    if len(slopes) >= 5:
+        lo, hi = np.nanpercentile(slopes, [5, 95])
+        lo = max(abs_min, float(lo))
+        hi = min(abs_max, float(hi))
+    else:
+        lo, hi = abs_min, abs_max
+    coeff = float(np.clip(coeff, lo, hi))
 
-    if len(ratios) < 2:
-        return 0.030, "global_fallback"
-
-    lo, hi = np.percentile(ratios, [10, 90])
-    robust_ratios = ratios[(ratios >= lo) & (ratios <= hi)]
-    coeff = float(robust_ratios.mean())
-    coeff = float(np.clip(coeff, 0.005, 0.15))
-
-    quality = "product_specific" if len(ratios) >= 5 else "product_limited"
+    quality = "product_specific" if len(slopes) >= 5 else "product_limited"
     return coeff, quality
 
 
@@ -1807,7 +1862,7 @@ def predict_product_price(
             if hist_std_chk > 0 and mat_name not in material_warned:
                 shock_sigma = abs(new_price - hist_mean_chk) / hist_std_chk
                 if shock_sigma > 10.0:
-                    score -= 80
+                    score = min(score, 20)
                     warnings.append(
                         f"🚨 【{mat_name}】调价幅度 {shock_sigma:.1f}σ，属于极端异常值，"
                         f"预测结果不具有参考意义（历史均价 {hist_mean_chk:.2f}，"
@@ -1815,19 +1870,19 @@ def predict_product_price(
                     )
                     material_warned.add(mat_name)
                 elif shock_sigma > 5.0:
-                    score -= 50
+                    score = min(score, 50)
                     warnings.append(
                         f"⚠️ 【{mat_name}】调价幅度 {shock_sigma:.1f}σ，远超历史范围，可信度极低"
                     )
                     material_warned.add(mat_name)
                 elif shock_sigma > 3.0:
-                    score -= 25
+                    score = min(score, 75)
                     warnings.append(
                         f"⚠️ 【{mat_name}】调价幅度 {shock_sigma:.1f}σ，超出历史波动范围"
                     )
                     material_warned.add(mat_name)
                 elif shock_sigma > 2.0:
-                    score -= 8
+                    score = min(score, 92)
 
             if hist_mean_chk > 1e-12 and mat_name not in material_warned:
                 abs_ratio = abs(new_price - hist_mean_chk) / hist_mean_chk
@@ -1899,9 +1954,9 @@ def predict_product_price(
         _weight_safe = weight if (weight and not math.isnan(weight) and weight > 0) else 1.0
         point_total = point_per_kg * _weight_safe
         method = f"conduction_coeff({coeff_quality})"
-        score -= 20
+        score = min(score, 80)
         if coeff_quality == "global_fallback":
-            score -= 15
+            score = min(score, 65)
             warnings.append("该产品BOM历史样本不足，传导系数使用全局兜底值，可信度较低")
 
         if base_bom_total <= 0:
@@ -1947,9 +2002,9 @@ def predict_product_price(
     # ── 步骤E：可信度评分修正项 ───────────────────────────────────────────
     n_price_months = base_data["n_price_months"]
     if n_price_months >= 12:
-        score += 5
+        score = min(100, score + 5)
     elif n_price_months < 4:
-        score -= 15
+        score = min(score, 85)
         warnings.append(f"价格历史仅 {n_price_months} 个月，样本偏少")
 
     p_hist_df = base_data["p_hist"]
@@ -1960,7 +2015,7 @@ def predict_product_price(
         if labor_mean > 0:
             labor_cv = labor_std / labor_mean
             if labor_cv > 0.10:
-                score -= 10
+                score = min(score, 90)
                 warnings.append(
                     f"材料成本历史波动较大（CV={labor_cv:.1%}），固定基准假设可能低估不确定性"
                 )

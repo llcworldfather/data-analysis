@@ -46,6 +46,7 @@ from process_excel import (
     top3_per_product,
     sheet_price_history,
     normalize_columns,
+    norm_material_code,
     REQUIRED_COLS,
     COL_PRODUCT,
     COL_COMPONENT,
@@ -63,6 +64,20 @@ UPLOAD_DIR = WEB_DIR / "uploads"
 RESULT_DIR = WEB_DIR / "results"
 UPLOAD_DIR.mkdir(exist_ok=True)
 RESULT_DIR.mkdir(exist_ok=True)
+
+# BI 内存缓存（淘汰 + 写入须在同一锁内，避免并发竞态）
+_BI_CACHE: dict = {}
+_BI_CACHE_LOCK = threading.Lock()
+_BI_CACHE_MAX = 8
+
+
+def _bi_cache_put(token: str, entry: dict) -> None:
+    """原子写入：容量淘汰与赋值在同一把锁内完成。"""
+    with _BI_CACHE_LOCK:
+        if len(_BI_CACHE) >= _BI_CACHE_MAX and token not in _BI_CACHE:
+            oldest = min(_BI_CACHE, key=lambda k: _BI_CACHE[k]["ts"])
+            del _BI_CACHE[oldest]
+        _BI_CACHE[token] = entry
 
 
 def _load_env_file(path: Path) -> None:
@@ -255,8 +270,7 @@ def _read_xlsx_as_polars(path: Path) -> pl.DataFrame:
 
 def _norm_product_code_series(s: pd.Series) -> pd.Series:
     """统一成品物料号为纯数字字符串，避免 Excel 浮点列变成 '8010040004.0' 导致与 BOM 对不齐。"""
-    x = s.astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
-    return x.replace({"nan": "", "None": "", "<NA>": ""})
+    return norm_material_code(s)
 
 
 # 产品价格历史清单模板：除「总成本→产品价格」外，下列列会一并并入 BOM 行（按产品/日期对齐）
@@ -744,11 +758,7 @@ def _fill_bi_cache(
         "price_pd":             price_pd,
         "ts":                   time.time(),
     }
-    with _BI_CACHE_LOCK:
-        if len(_BI_CACHE) >= _BI_CACHE_MAX and token not in _BI_CACHE:
-            oldest = min(_BI_CACHE, key=lambda k: _BI_CACHE[k]["ts"])
-            del _BI_CACHE[oldest]
-        _BI_CACHE[token] = entry
+    _bi_cache_put(token, entry)
 
 
 @app.route("/api/process", methods=["POST"])
@@ -897,12 +907,6 @@ def process():
 # BI Analysis – 内存缓存（避免每次请求重复读 Excel）
 # ---------------------------------------------------------------------------
 
-# 结构：{ session_id: { "summary", "detail", "product_bom", "price_history", "ts" } }
-_BI_CACHE: dict = {}
-_BI_CACHE_LOCK = threading.Lock()
-_BI_CACHE_MAX  = 8   # 最多同时缓存 8 个 session，超出时淘汰最久未访问的
-
-
 def _load_bi_cache(session_id: str, file_path: Path) -> dict:
     """
     读取 Excel 中 BI 用表，构建索引后存入缓存并返回。
@@ -950,12 +954,7 @@ def _load_bi_cache(session_id: str, file_path: Path) -> dict:
         "ts":                   time.time(),
     }
 
-    with _BI_CACHE_LOCK:
-        if len(_BI_CACHE) >= _BI_CACHE_MAX and session_id not in _BI_CACHE:
-            oldest = min(_BI_CACHE, key=lambda k: _BI_CACHE[k]["ts"])
-            del _BI_CACHE[oldest]
-        _BI_CACHE[session_id] = entry
-
+    _bi_cache_put(session_id, entry)
     return entry
 
 
