@@ -386,7 +386,7 @@
           重置
         </button>
 
-        <button onclick="queryAiPurchaseAdvice()"
+        <button id="ai-advice-btn" onclick="queryAiPurchaseAdvice()"
                 class="flex items-center gap-1.5 bg-amber-500 hover:bg-amber-600 active:bg-amber-700 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors flex-shrink-0">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -1192,9 +1192,19 @@ function resetPriceFilter() {
 }
 
 async function queryAiPurchaseAdvice() {
+  // 防重复点击：按钮处于 loading 状态时忽略
+  const btn = document.getElementById('ai-advice-btn');
+  if (btn && btn.dataset.loading === '1') return;
+  if (btn) { btn.dataset.loading = '1'; btn.style.opacity = '0.6'; btn.style.cursor = 'not-allowed'; }
+
   show('ai-advice-panel', false);
   show('ai-advice-loading', true);
-  document.getElementById('ai-advice-text').innerHTML = '';
+  const adviceTextEl = document.getElementById('ai-advice-text');
+  adviceTextEl.innerHTML = '';
+
+  function resetBtn() {
+    if (btn) { btn.dataset.loading = ''; btn.style.opacity = ''; btn.style.cursor = ''; }
+  }
 
   try {
     const res = await fetch(`/api/bi/ai_purchase_advice_stream/${TOKEN}`);
@@ -1202,34 +1212,23 @@ async function queryAiPurchaseAdvice() {
       const json = await res.json().catch(() => ({}));
       toast(json.error || 'AI 建议生成失败', 'error');
       show('ai-advice-loading', false);
+      resetBtn();
       return;
     }
 
     show('ai-advice-loading', false);
     show('ai-advice-panel', true);
 
+    // 等待 DeepSeek 开始输出前的占位提示（通常需 15–30s 工具调用）
+    adviceTextEl.innerHTML =
+      '<p class="text-amber-500 text-sm animate-pulse">⏳ DeepSeek 正在联网查询行情，请稍候（通常需要 15–30 秒）…</p>';
+
     const reader = res.body.getReader();
     const decoder = new TextDecoder('utf-8');
     let buffer = '';
     let markdown = '';
     let hadError = false;
-    let renderTimer = null;
-    let lastRenderedMarkdown = '';
-    const adviceTextEl = document.getElementById('ai-advice-text');
-
-    function renderAdviceNow(force = false) {
-      if (!force && markdown === lastRenderedMarkdown) return;
-      lastRenderedMarkdown = markdown;
-      adviceTextEl.innerHTML = renderMarkdown(markdown);
-    }
-
-    function scheduleAdviceRender() {
-      if (renderTimer) return;
-      renderTimer = setTimeout(() => {
-        renderTimer = null;
-        renderAdviceNow(false);
-      }, 160);
-    }
+    let streamPre = null;   // 流式阶段用 <pre> 追加纯文本，避免 innerHTML 闪烁
 
     function handleSseBlock(block) {
       if (!block.trim()) return;
@@ -1248,19 +1247,31 @@ async function queryAiPurchaseAdvice() {
           range.start && range.end ? `分析区间：${range.start} 至 ${range.end}` : '分析区间：最近三个月';
         document.getElementById('ai-advice-total').textContent = `共 ${fmt(data.total || 0)} 个物料`;
         renderAiMaterialsPreview(data.materials || []);
+
       } else if (event === 'delta') {
-        markdown += data.text || '';
-        scheduleAdviceRender();
+        // 第一个 delta 到来：清除占位符，创建 <pre> 用于无闪烁追加
+        if (!streamPre) {
+          adviceTextEl.innerHTML = '';
+          streamPre = document.createElement('pre');
+          streamPre.className = 'whitespace-pre-wrap text-sm text-slate-700 leading-7 font-sans';
+          adviceTextEl.appendChild(streamPre);
+        }
+        const chunk = data.text || '';
+        markdown += chunk;
+        // textContent 追加不触发 HTML 解析，零闪烁
+        streamPre.textContent += chunk;
+        // 自动滚到最新文字
+        adviceTextEl.scrollTop = adviceTextEl.scrollHeight;
+
       } else if (event === 'error') {
         hadError = true;
         toast(data.error || 'AI 建议生成失败', 'error');
+
       } else if (event === 'done') {
-        if (renderTimer) {
-          clearTimeout(renderTimer);
-          renderTimer = null;
-        }
-        renderAdviceNow(true);
+        // 流结束：用完整 Markdown 渲染替换 <pre> 纯文本
+        adviceTextEl.innerHTML = renderMarkdown(markdown);
         if (!hadError) toast('AI 采购建议已生成', 'success');
+        resetBtn();
       }
     }
 
@@ -1272,15 +1283,18 @@ async function queryAiPurchaseAdvice() {
       buffer = parts.pop() || '';
       for (const part of parts) handleSseBlock(part);
     }
+    // 处理最后一块不完整的 SSE（流意外断开时）
     if (buffer.trim()) handleSseBlock(buffer);
-    if (renderTimer) {
-      clearTimeout(renderTimer);
-      renderTimer = null;
+    // 流异常结束时仍尝试渲染已有内容
+    if (markdown && !adviceTextEl.querySelector(':not(pre)')) {
+      adviceTextEl.innerHTML = renderMarkdown(markdown);
     }
-    renderAdviceNow(true);
+    resetBtn();
+
   } catch (err) {
     show('ai-advice-loading', false);
     toast('AI 建议生成失败：' + String(err), 'error');
+    resetBtn();
   }
 }
 

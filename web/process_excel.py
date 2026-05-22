@@ -37,6 +37,17 @@ COL_CATEGORY   = "分类"
 
 REQUIRED_COLS = [COL_PRODUCT, COL_COMPONENT, COL_QTY, COL_UNIT_PRICE]
 
+# 读 Excel 时强制 Utf8，避免 SAP 物料号被解析为浮点（8010040004.0）
+MATERIAL_CODE_COLUMN_NAMES = frozenset({
+    COL_PRODUCT,
+    COL_COMPONENT,
+    "ZMATNR",
+    "IDNRK",
+    "MATNR",
+    "所属产品",
+    "材料编码",
+})
+
 # SAP / 内控清单列名 → 脚本标准列名（自动映射，多种导出格式均可直接使用）
 _COL_ALIASES: dict[str, str] = {
     # SAP 导出
@@ -89,18 +100,57 @@ def norm_material_code(series: pd.Series) -> pd.Series:
 
 
 def norm_material_code_expr(col: str) -> pl.Expr:
-    """Polars 向量化物料编码规范化（替代 map_elements）。"""
-    c = (
-        pl.col(col)
-        .cast(pl.String)
-        .str.strip_chars()
-        .str.replace(r"\.0+$", "")
-    )
+    """Polars 向量化物料编码规范化（读入已为 Utf8 时仅 strip + 空值清洗）。"""
+    c = pl.col(col).cast(pl.String).str.strip_chars()
     return (
         pl.when(c.is_null() | c.is_in(["nan", "None", "<NA>", ""]))
         .then(pl.lit(""))
         .otherwise(c)
     )
+
+
+def material_code_schema_overrides(columns: list[str]) -> dict[str, pl.DataType]:
+    return {c: pl.Utf8 for c in columns if c in MATERIAL_CODE_COLUMN_NAMES}
+
+
+def pandas_material_code_dtypes(columns: list[str]) -> dict[str, type]:
+    return {c: str for c in columns if c in MATERIAL_CODE_COLUMN_NAMES}
+
+
+def _excel_header_columns(path: Path) -> list[str]:
+    if path.suffix.lower() == ".xls":
+        return list(pd.read_excel(path, sheet_name=0, nrows=0).columns)
+    try:
+        return list(pl.read_excel(path, sheet_id=1, n_rows=0).columns)
+    except Exception:
+        return list(pd.read_excel(path, sheet_name=0, nrows=0).columns)
+
+
+def read_excel_as_polars(path: Path) -> pl.DataFrame:
+    """读取 Excel 第一张表；物料编码列在源头强制为字符串。"""
+    cols = _excel_header_columns(path)
+    overrides = material_code_schema_overrides(cols)
+    if path.suffix.lower() == ".xls":
+        dtype = pandas_material_code_dtypes(cols)
+        return pl.from_pandas(
+            pd.read_excel(path, sheet_name=0, dtype=dtype or None)
+        )
+    try:
+        if overrides:
+            return pl.read_excel(path, schema_overrides=overrides)
+        return pl.read_excel(path)
+    except Exception:
+        dtype = pandas_material_code_dtypes(cols)
+        return pl.from_pandas(
+            pd.read_excel(path, sheet_name=0, dtype=dtype or None)
+        )
+
+
+def read_price_excel(path: Path) -> pd.DataFrame:
+    """产品价格历史清单：产品编码列以字符串读入。"""
+    cols = _excel_header_columns(path)
+    dtype = pandas_material_code_dtypes(cols)
+    return pd.read_excel(path, sheet_name=0, dtype=dtype or None)
 
 
 # ---------------------------------------------------------------------------
@@ -141,11 +191,11 @@ def _print_no_excel_error() -> None:
 
 def _read_one_excel_lazy(path: Path) -> pl.LazyFrame:
     print(f"  读取：{path.name}")
-    try:
-        lf = pl.scan_excel(path)
-    except Exception:
-        lf = pl.from_pandas(pd.read_excel(path, sheet_name=0)).lazy()
-    return lf.with_columns(pl.lit(path.name).alias("_源文件"))
+    return (
+        read_excel_as_polars(path)
+        .lazy()
+        .with_columns(pl.lit(path.name).alias("_源文件"))
+    )
 
 
 def _read_one_excel(path: Path) -> pl.DataFrame:
@@ -214,11 +264,15 @@ def prepare(raw: pl.DataFrame) -> pl.DataFrame:
 
 
 def aggregate_lines(d: pl.DataFrame) -> pl.DataFrame:
-    """按 产品编码+组件编码 分组，汇总用量、取均价、取计量单位与组件名称。"""
+    """按 产品编码+组件编码 分组，汇总用量、取加权均价、取计量单位与组件名称。"""
     gcols = [COL_PRODUCT, COL_COMPONENT]
     agg_exprs: list[pl.Expr] = [
         pl.col(COL_QTY).sum().alias("MENGE合计"),
-        pl.col(COL_UNIT_PRICE).mean().alias("组件单价"),
+        # 加权平均单价：Σ(用量×单价) / Σ用量，与 enrich 中行成本计算一致
+        (
+            (pl.col(COL_QTY) * pl.col(COL_UNIT_PRICE)).sum()
+            / pl.col(COL_QTY).sum()
+        ).alias("组件单价"),
     ]
     if COL_UNIT in d.columns:
         agg_exprs.append(pl.col(COL_UNIT).first().alias("计量单位"))
@@ -363,7 +417,10 @@ def sheet_cross_product_volatility(lines: pl.DataFrame) -> pl.DataFrame:
         ])
         .filter(pl.col("涉及产品数") >= 2)
         .with_columns(
-            (pl.col("用量占比标准差") / pl.col("平均用量占比%")).round(4).alias("变异系数CV")
+            pl.when(pl.col("平均用量占比%").abs() > 1e-9)
+            .then((pl.col("用量占比标准差") / pl.col("平均用量占比%")).round(4))
+            .otherwise(None)
+            .alias("变异系数CV")
         )
         .sort("变异系数CV", descending=True, nulls_last=True)
     )

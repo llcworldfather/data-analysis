@@ -29,7 +29,7 @@
     <p class="text-sm text-slate-600 mb-6">
       修改各组件<strong>材料单价</strong>后，系统会<strong>预测该产品的报价/总成本</strong>，并给出三个独立维度的结果：
       <br><span class="text-slate-700">・<strong>敏感性分析</strong></span>（调价后显示）：若某组件单价在您输入值 ±10% 范围内波动，产品价格大约变动多少。
-      <br><span class="text-slate-700">・<strong>模型历史误差</strong></span>（始终显示）：用历史月份回测（剔除材料成本异常跳变月），以稳健 MAE 给出「点估计 ±1.5×MAE」区间，反映公式本身精度，与是否调价无关。
+      <br><span class="text-slate-700">・<strong>模型历史误差</strong></span>（始终显示）：用历史月份回测（剔除材料成本异常跳变月）得到稳健 MAE；展示区间为「点估计 ±1.5×MAE」，<strong>若您本次改价使 BOM 合计偏离基准，区间会按偏离幅度等比例加宽</strong>。
       <br><span class="text-slate-700">・<strong>模型可信度</strong></span>：反映本次调价在历史数据中的支撑程度。
       <br>材料单价、价格清单中的成本均为<strong>元/公斤</strong>；产品总价 = 每公斤价 × <strong>重量(kg)</strong>。
       建议同时上传：<strong>报价BOM历史清单</strong>和<strong>产品价格历史清单</strong>。
@@ -49,6 +49,10 @@
       <button type="button" id="btn-sim" class="px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700">计算预测产品价</button>
       <button type="button" id="btn-reset" class="px-4 py-2 rounded-lg border border-slate-300 text-sm text-slate-700 hover:bg-slate-100">单价恢复为当前值</button>
     </div>
+    <p id="pending-hint" class="hidden mb-4 text-sm text-amber-900 bg-amber-50 border border-amber-300 rounded-lg px-3 py-2">
+      您已修改组件单价，表格「模拟行成本」为即时估算；上方<strong>预测产品价格 / 敏感性分析</strong>需点击
+      <strong>「计算预测产品价」</strong>后才会更新。
+    </p>
 
     <div id="summary" class="hidden grid sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
       <div class="lg:col-span-2 bg-indigo-600 text-white rounded-xl p-5 shadow-md">
@@ -107,17 +111,17 @@
       <div class="rounded-xl border-2 border-emerald-200 bg-emerald-50/40 p-5 shadow-sm">
         <div class="text-sm font-semibold text-slate-800 mb-3">模型历史误差</div>
         <p class="text-[10px] text-slate-500 mb-2 leading-snug">
-          <strong>与当前是否调价无关</strong>：用历史各月 BOM 回测公式，看预测价相对实际价（元/kg）的典型偏差。
+          用历史各月 BOM 回测公式，得到<strong>公式本身</strong>的典型偏差（MAE）；展示区间在 MAE 基础上，会随您本次模拟调价幅度加大而变宽。
         </p>
         <p id="model-error-compare" class="text-[10px] text-emerald-900/90 mb-3 leading-snug border-l-2 border-emerald-400 pl-2 bg-emerald-50/60 rounded-r">
-          与左侧「敏感性分析」区间可能数值接近，但含义不同：本卡片反映<strong>公式本身</strong>的历史平均偏差（见下方 MAE），不是组件再浮动 ±10% 的结果。
+          与左侧「敏感性分析」区间可能数值接近，但含义不同：本卡片 MAE 来自历史回测；上方区间 = MAE×(1+灵敏度×|ΔBOM|/基准BOM)，不是组件再浮动 ±10% 的结果。
         </p>
         <dl class="grid grid-cols-2 gap-x-3 gap-y-2 text-[11px] mb-3">
           <div><dt class="text-slate-500">MAE（稳健）</dt><dd id="model-rmse" class="font-semibold num text-emerald-800">—</dd></div>
           <div><dt class="text-slate-500">回测样本</dt><dd id="model-n" class="font-semibold num text-slate-800">—</dd></div>
         </dl>
         <div class="mb-2">
-          <div class="text-xs text-slate-500 mb-1">预测区间（点估计 ±1.5×MAE，元/kg）</div>
+          <div class="text-xs text-slate-500 mb-1">预测区间（点估计 ±动态半宽，元/kg）</div>
           <div class="flex items-center gap-2 flex-wrap">
             <span id="model-interval-lo" class="text-lg font-bold num text-emerald-800">—</span>
             <span class="text-slate-400 text-sm">～</span>
@@ -161,6 +165,7 @@
     let refTotalCost = null;
     let defaultPrices = {};
     let lineState = {};
+    let pricesDirty = false;
 
     let searchRequired = false;
     let productIds = [];
@@ -452,24 +457,34 @@
           const maeVal = me.MAE != null ? me.MAE : me.RMSE;
           const halfW = me.区间半宽 != null ? Number(me.区间半宽) : (maeVal != null ? 1.5 * Number(maeVal) : null);
           const ivNote = me.区间口径 || "点估计 ± 1.5×MAE（稳健）";
+          const scale = me.区间放大系数 != null ? Number(me.区间放大系数) : 1;
+          const bomPert = me.BOM扰动比例 != null ? Number(me.BOM扰动比例) : 0;
           let extra = "";
           if (me.剔除异常月数 > 0) {
             extra = "（已剔除 " + me.剔除异常月数 + " 个材料成本异常跳变月）";
           }
+          let widen = "";
+          if (scale > 1.001 && bomPert > 1e-6) {
+            widen = "；本次 BOM 偏离基准约 " + (bomPert * 100).toFixed(1) + "%，区间已放大 ×" + fmt(scale);
+          }
           let desc =
             "历史 " + (me.样本数 || "—") + " 个月回测" + extra +
             "：稳健 MAE ≈ " + fmt(maeVal) + " 元/kg" +
-            (halfW != null ? "（典型偏差量级；显示区间为当前预测 " + ivNote + "，半宽约 ±" + fmt(halfW) + " 元/kg）" : "") +
+            (halfW != null ? "（显示区间为当前预测 " + ivNote + "，半宽约 ±" + fmt(halfW) + " 元/kg" + widen + "）" : widen) +
             (pt != null ? "。当前点估计 " + fmt(pt) + " 元/kg。" : "。");
           if (me["区间较窄说明"]) {
             desc += " " + me["区间较窄说明"];
           }
           meDesc.textContent = desc;
           if (compareEl && maeVal != null) {
+            let widenCmp = "";
+            if (scale > 1.001 && bomPert > 1e-6) {
+              widenCmp = "（已按 BOM 偏离放大 ×" + fmt(scale) + "）";
+            }
             compareEl.innerHTML =
-              "与左侧「敏感性分析」区间可能数值接近，但含义不同：本卡片表示<strong>不管你怎么调价</strong>，公式在历史上相对实际价的典型偏差约 <span class=\"num font-medium\">±" +
-              fmt(maeVal) + " 元/kg</span>（MAE）；上方区间为当前预测 <span class=\"num font-medium\">±" +
-              fmt(halfW != null ? halfW : 1.5 * maeVal) + " 元/kg</span>（1.5×MAE）。";
+              "与左侧「敏感性分析」区间可能数值接近，但含义不同：历史回测 MAE ≈ <span class=\"num font-medium\">±" +
+              fmt(maeVal) + " 元/kg</span>；上方区间为当前预测 <span class=\"num font-medium\">±" +
+              fmt(halfW != null ? halfW : 1.5 * maeVal) + " 元/kg</span>" + widenCmp + "。";
           }
         }
       } else {
@@ -605,15 +620,17 @@
       tb.innerHTML = "";
       document.getElementById("empty-hint").classList.add("hidden");
       document.getElementById("summary").classList.remove("hidden");
+      setPricesDirty(false);
       applyPredictionUI(j);
 
       for (const row of j.lines || []) {
         const comp = String(row["组件编码"] ?? "");
+        const m = Number(row["MENGE合计"] ?? 0);
         const p0 = Number(row["组件单价"] ?? 0);
         const lineCost = Number(row["行原材料成本"] ?? 0);
         const pct = Number(row["成本占产品%"] ?? 0);
         defaultPrices[comp] = p0;
-        lineState[comp] = { line: lineCost, pct };
+        lineState[comp] = { line: lineCost, pct, qty: m };
         const tr = document.createElement("tr");
         tr.className = "border-t border-slate-100 hover:bg-slate-50";
         tr.innerHTML = `
@@ -640,6 +657,51 @@
       return prices;
     }
 
+    function setPricesDirty(on) {
+      pricesDirty = on;
+      const hint = document.getElementById("pending-hint");
+      const btn = document.getElementById("btn-sim");
+      if (hint) hint.classList.toggle("hidden", !on);
+      if (btn) btn.classList.toggle("ring-2", on), btn.classList.toggle("ring-indigo-400", on);
+    }
+
+    function refreshLocalBomRows() {
+      let simTotal = 0;
+      document.querySelectorAll("#tbody tr").forEach((tr) => {
+        const inp = tr.querySelector(".price-inp");
+        if (!inp) return;
+        const comp = inp.getAttribute("data-comp");
+        const qty = lineState[comp]?.qty ?? 0;
+        const price = Number(inp.value);
+        const line = qty * price;
+        if (Number.isFinite(line)) simTotal += line;
+        const tdLine = tr.querySelector(".td-sim-line");
+        if (tdLine) tdLine.textContent = fmt(line);
+      });
+      document.getElementById("v-sim").textContent = fmt(simTotal);
+      document.querySelectorAll("#tbody tr").forEach((tr) => {
+        const inp = tr.querySelector(".price-inp");
+        const tdPct = tr.querySelector(".td-sim-pct");
+        if (!inp || !tdPct) return;
+        const comp = inp.getAttribute("data-comp");
+        const qty = lineState[comp]?.qty ?? 0;
+        const line = qty * Number(inp.value);
+        tdPct.textContent = simTotal > 1e-12 ? fmt((100 * line) / simTotal) : "0";
+      });
+    }
+
+    function onPriceInputChanged() {
+      let changed = false;
+      document.querySelectorAll(".price-inp").forEach((inp) => {
+        const comp = inp.getAttribute("data-comp");
+        const v = Number(inp.value);
+        const d = defaultPrices[comp];
+        if (d != null && Math.abs(v - d) > 1e-9) changed = true;
+      });
+      setPricesDirty(changed);
+      refreshLocalBomRows();
+    }
+
     async function simulate() {
       showErr("");
       const pid = document.getElementById("product-input").value.trim();
@@ -656,6 +718,7 @@
       if (!res.ok) throw new Error(j.error || res.statusText);
 
       applyPredictionUI(j);
+      setPricesDirty(false);
 
       const byComp = {};
       (j.lines || []).forEach((ln) => {
@@ -689,6 +752,10 @@
     productSuggest.addEventListener("mousedown", (e) => e.preventDefault());
     document.addEventListener("click", (e) => {
       if (!productInput.contains(e.target) && !productSuggest.contains(e.target)) hideSuggest();
+    });
+
+    document.getElementById("tbody").addEventListener("input", (e) => {
+      if (e.target && e.target.classList.contains("price-inp")) onPriceInputChanged();
     });
 
     document.getElementById("btn-load").addEventListener("click", () => loadBom().catch((e) => showErr(e.message)));

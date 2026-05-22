@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import math
+import os
+import random
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -23,11 +25,14 @@ from process_excel import (
     COL_MAKTX,
     COL_PRODUCT,
     COL_QTY,
+    COL_UNIT,
     COL_UNIT_PRICE,
     norm_material_code,
     norm_material_code_expr,
     norm_material_code_scalar,
     normalize_columns,
+    pandas_material_code_dtypes,
+    read_price_excel,
 )
 
 MAX_REG_FEATURES = 40
@@ -43,9 +48,55 @@ TIME_DECAY_LAMBDA = 0.2
 # 斜率池 MAD 离群过滤（样本数不足时跳过）
 SLOPE_MAD_K = 3.5
 SLOPE_MAD_MIN_SAMPLES = 4
+SLOPE_POOL_MAX = 5000
+# 传导系数 (元/kg)/(元/件) 默认裁剪；有重量时上界随重量收紧
+CONDUCTION_COEFF_ABS_MIN = 0.005
+CONDUCTION_COEFF_ABS_MAX = 0.15
 # 低价值物料：不参与超区间扣分 / σ 冲击
 LOW_VALUE_UNIT_PRICE_YUAN = 0.5
 MIN_BASE_AMOUNT_YUAN = 1.0
+INVALID_BOM_DATE = "00000000"
+MIN_VALID_BOM_DATE = "19000101"
+# 价格清单：数值明显大于典型「每公斤」报价时推断为元/件（可用环境变量覆盖）
+def _per_piece_total_threshold_yuan() -> float:
+    try:
+        return float(os.environ.get("PER_PIECE_TOTAL_THRESHOLD_YUAN", "12"))
+    except ValueError:
+        return 12.0
+
+
+PER_PIECE_TOTAL_THRESHOLD_YUAN = _per_piece_total_threshold_yuan()
+
+UnitHint = Literal["piece", "kg", "unknown"]
+
+_PIECE_UNIT_TOKENS = frozenset(
+    {"PC", "ST", "EA", "SET", "PCS", "PCE", "件", "个", "只", "套", "台"}
+)
+_KG_UNIT_TOKENS = frozenset(
+    {"KG", "KGM", "千克", "公斤", "G", "克", "GRAM", "GR", "GM"}
+)
+_UNIT_HINT_COLUMN_KEYS = ("MEINS", "基本单位", "计量单位", COL_UNIT)
+# Shock σ：非核心件（行成本占基准 BOM 低于此比例）豁免封顶扣分
+SHOCK_NON_CORE_BOM_SHARE = 0.01
+SHOCK_MIN_EFFECTIVE_STD_YUAN = 0.05
+SHOCK_ABS_DELTA_CAP_YUAN = 0.5
+# 单价低于此值时，σ 封顶链改用相对涨幅阈值（辅料微量波动）
+LOW_VALUE_REL_SIGMA_UNIT_YUAN = 2.0
+LOW_VALUE_REL_SIGMA_RATIO = 3.0
+# 相对加载基准倍数 R：分段可信度上限（见 _credibility_cap_from_ref_multiple）
+CREDIBILITY_REF_NORMAL_MAX = 1.1
+CREDIBILITY_REF_ABNORMAL_MIN = 5.0
+CREDIBILITY_REF_FLOOR_CAP = 15
+# (R 下界, R 上界, 区间起始分, 区间结束分, 提示文案；下界不含、上界含)
+CREDIBILITY_REF_BANDS: list[tuple[float, float, int, int, str]] = [
+    (1.1, 1.3, 100, 90, "价格略微偏离加载基准价（当前 {R} 倍）"),
+    (1.3, 1.6, 90, 75, "价格明显偏离加载基准价（当前 {R} 倍）"),
+    (1.6, 2.0, 75, 55, "价格严重偏离，请核对单位（当前 {R} 倍）"),
+    (2.0, 3.5, 55, 35, "价格存在极大偏差（当前 {R} 倍）"),
+    (3.5, 5.0, 35, 15, "价格极度异常，可信度极低（当前 {R} 倍）"),
+]
+# 模型历史误差区间：随模拟 BOM 偏离基准而放大
+MODEL_ERROR_GAMMA = 0.5
 
 _DATE_ALIASES = ("创建日期", "生价日期", "CREATEDATE", "生产日期", "日期")
 
@@ -224,11 +275,196 @@ def _safe_float(v: Any) -> float | None:
         return None
 
 
+def normalize_unit_hint(unit: Any) -> UnitHint:
+    """将 MEINS / 基本单位等规范为 piece | kg | unknown。"""
+    if unit is None:
+        return "unknown"
+    s = str(unit).strip().upper()
+    if not s or s in ("NAN", "NONE", "<NA>", ""):
+        return "unknown"
+    if s in _PIECE_UNIT_TOKENS:
+        return "piece"
+    if s in _KG_UNIT_TOKENS:
+        return "kg"
+    if any(tok in s for tok in ("件", "个", "只")):
+        return "piece"
+    if any(tok in s for tok in ("千克", "公斤", "KG")):
+        return "kg"
+    return "unknown"
+
+
+def _latest_valid_bom_date(dates: "pd.Series | pl.Series") -> str:
+    """忽略 00000000 / 无效日期后取最大 8 位日期；全无有效日期时退回全表 max。"""
+    if hasattr(dates, "to_pandas"):
+        dates = dates.to_pandas()
+    s = dates.astype(str).str.strip().str[:8]
+    valid = s[(s > MIN_VALID_BOM_DATE) & (s != INVALID_BOM_DATE)]
+    if len(valid):
+        return str(valid.max())
+    return str(s.max()) if len(s) else INVALID_BOM_DATE
+
+
+def unit_hint_from_row(row: Any) -> UnitHint:
+    """从价格快照 dict 或 pandas Series 读取计量单位倾向。"""
+    if row is None:
+        return "unknown"
+    for key in _UNIT_HINT_COLUMN_KEYS:
+        if isinstance(row, dict):
+            if key in row and row[key] not in (None, ""):
+                return normalize_unit_hint(row[key])
+        elif hasattr(row, "index") and key in row.index:
+            v = row.get(key) if hasattr(row, "get") else row[key]
+            if v is not None and not (isinstance(v, float) and math.isnan(v)):
+                if str(v).strip():
+                    return normalize_unit_hint(v)
+    return "unknown"
+
+
+def unit_hint_from_bom_dataframe(
+    bom_df: pd.DataFrame | None,
+    product_id: str,
+) -> UnitHint:
+    """按最新 BOM 行成本加权，推断成品计量单位倾向（PC vs KG）。"""
+    if bom_df is None or bom_df.empty or COL_PRODUCT not in bom_df.columns:
+        return "unknown"
+    pid = norm_material_code_scalar(product_id)
+    sub = bom_df[norm_material_code(bom_df[COL_PRODUCT]) == pid].copy()
+    if sub.empty:
+        return "unknown"
+    unit_col = next((c for c in _UNIT_HINT_COLUMN_KEYS if c in sub.columns), None)
+    if not unit_col:
+        return "unknown"
+    if COL_CREATEDATE in sub.columns:
+        sub["_date"] = norm_material_code(sub[COL_CREATEDATE]).str[:8]
+        latest = _latest_valid_bom_date(sub["_date"])
+        sub = sub[sub["_date"] == latest]
+    qty = pd.to_numeric(
+        sub[COL_QTY] if COL_QTY in sub.columns else 0, errors="coerce"
+    ).fillna(0.0)
+    price = pd.to_numeric(
+        sub[COL_UNIT_PRICE] if COL_UNIT_PRICE in sub.columns else 0, errors="coerce"
+    ).fillna(0.0)
+    weights = qty * price
+    votes: dict[str, float] = {"piece": 0.0, "kg": 0.0}
+    for u, w in zip(sub[unit_col], weights):
+        hint = normalize_unit_hint(u)
+        if hint in votes and w > 0:
+            votes[hint] += float(w)
+    if votes["piece"] > votes["kg"] * 1.05:
+        return "piece"
+    if votes["kg"] > votes["piece"] * 1.05:
+        return "kg"
+    return "unknown"
+
+
+def _resolve_cost_unit_hint(
+    unit_hint: UnitHint | str | None,
+) -> UnitHint:
+    if unit_hint in ("piece", "kg", "unknown"):
+        return unit_hint  # type: ignore[return-value]
+    return normalize_unit_hint(unit_hint)
+
+
+def _ref_multiple_magnitude(ref_mult: float) -> float | None:
+    """相对加载基准的偏离倍数 R（涨价为 ref_mult，跌价为 1/ref_mult）。"""
+    if not math.isfinite(ref_mult) or ref_mult <= 0:
+        return None
+    return ref_mult if ref_mult >= 1.0 else 1.0 / ref_mult
+
+
+def _format_ref_multiple_label(r: float) -> str:
+    if r >= 100:
+        return f"{r:.1f}"
+    if r >= 10:
+        return f"{r:.2f}"
+    return f"{r:.2f}"
+
+
+def _credibility_cap_from_ref_multiple(
+    ref_mult: float,
+) -> tuple[int | None, str | None, str | None]:
+    """
+    相对「加载 BOM 时单价」的倍数 R → (可信度上限, 提示文案, R 展示串)。
+
+    R≤1.1：不扣分；1.1～5 分段线性插值；R>5：保底 15 分。
+    """
+    r = _ref_multiple_magnitude(ref_mult)
+    if r is None:
+        return None, None, None
+    r_label = _format_ref_multiple_label(r)
+    if r <= CREDIBILITY_REF_NORMAL_MAX:
+        return None, None, None
+    if r > CREDIBILITY_REF_ABNORMAL_MIN:
+        msg = f"价格已脱离实际市场参考（当前 {r_label} 倍）"
+        return CREDIBILITY_REF_FLOOR_CAP, msg, r_label
+    for r_lo, r_hi, cap_lo, cap_hi, template in CREDIBILITY_REF_BANDS:
+        if r <= r_hi:
+            span = r_hi - r_lo
+            t = (r - r_lo) / span if span > 0 else 1.0
+            cap = round(cap_lo + t * (cap_hi - cap_lo))
+            return cap, template.format(R=r_label), r_label
+    return CREDIBILITY_REF_FLOOR_CAP, (
+        f"价格已脱离实际市场参考（当前 {r_label} 倍）"
+    ), r_label
+
+
+def _price_list_values_imply_per_piece(
+    sum_ml: float,
+    total_f: float | None,
+    wt: float | None,
+) -> bool:
+    """
+    根据清单数值判断是否为「整件报价」（元/件）。
+    优先于 BOM 行上的 KG 单位提示——行单位是原料计量，成品价仍是元/件。
+    """
+    threshold = _per_piece_total_threshold_yuan()
+    if wt is None or wt <= 1e-12 or total_f is None or total_f <= 1e-12:
+        return False
+    if abs(sum_ml - total_f) / max(sum_ml, 1e-9) >= 0.06:
+        return False
+    if not (15.0 <= sum_ml <= threshold * 5):
+        return False
+    # 整件报价时「材料+工费」/重量 常为个位数元/kg；清单若已是元/kg 则往往 ≥ 阈值
+    if sum_ml / float(wt) < threshold:
+        return True
+    return False
+
+
+def _infer_costs_are_per_piece(
+    sum_ml: float,
+    total_f: float | None,
+    wt: float | None,
+    unit_hint: UnitHint,
+) -> bool:
+    """在材料+工费可用时，判定清单口径为元/件还是元/KG。"""
+    if _price_list_values_imply_per_piece(sum_ml, total_f, wt):
+        return True
+    if unit_hint == "piece":
+        return True
+    if unit_hint == "kg":
+        return False
+
+    threshold = _per_piece_total_threshold_yuan()
+    has_wt = wt is not None and wt > 1e-12
+    if has_wt:
+        if total_f is not None and total_f > 1e-12:
+            rel_sum_total = abs(sum_ml - total_f) / max(sum_ml, 1e-9)
+            if rel_sum_total < 0.06:
+                return sum_ml > threshold
+            if abs(sum_ml / wt - total_f) / max(total_f, 1e-9) < 0.08:
+                return True
+            return False
+        return sum_ml > threshold
+    return sum_ml > threshold
+
+
 def normalize_price_list_cost_fields(
     mat: float | None,
     labor: float | None,
     total: float | None,
     weight_kg: float | None,
+    *,
+    unit_hint: UnitHint | str | None = None,
 ) -> dict[str, Any]:
     """
     识别价格清单中 材料成本/工费/总成本 是 元/件 还是 元/KG，并统一输出两种口径。
@@ -256,21 +492,17 @@ def normalize_price_list_cost_fields(
         return out
 
     sum_ml = mat_f + labor_f
-    per_piece = False
-    if wt and wt > 1e-12:
-        if total_f is not None and total_f > 1e-12:
-            rel_sum_total = abs(sum_ml - total_f) / max(sum_ml, 1e-9)
-            if rel_sum_total < 0.06:
-                # 材料+工费与总成本同单位；数值明显大于典型「每公斤」报价 → 元/件
-                if sum_ml > 12.0:
-                    per_piece = True
-            elif abs(sum_ml / wt - total_f) / max(total_f, 1e-9) < 0.08:
-                # 材料/工费为整件，总成本列为每公斤
-                per_piece = True
-        elif sum_ml > 12.0:
-            per_piece = True
-    elif sum_ml > 12.0:
-        per_piece = True
+    uh = _resolve_cost_unit_hint(unit_hint)
+    per_piece = _infer_costs_are_per_piece(sum_ml, total_f, wt, uh)
+    # 兜底：1kg 轻量件 sum_ml≈元/kg，误判为元/件时按元/kg 重算
+    if per_piece and wt and wt > 1e-12:
+        probe_per_kg = (
+            (total_f / wt)
+            if total_f is not None and total_f > 1e-12
+            else sum_ml / wt
+        )
+        if float(probe_per_kg) > _per_piece_total_threshold_yuan() * 1.5:
+            per_piece = False
 
     out["costs_are_per_piece"] = per_piece
     if per_piece and wt and wt > 1e-12:
@@ -306,9 +538,79 @@ def normalize_price_list_cost_fields(
     return out
 
 
+def baseline_prices_from_price_snap(
+    price_snap: dict,
+    weight_kg: float | None,
+) -> dict[str, Any]:
+    """
+    从价格清单快照解析基准整件价(元/件)与基准价(元/kg)。
+    供 Web 映射层与预测模块共用，避免 app 内重复口径逻辑。
+    """
+    wt = _safe_float(weight_kg)
+    if wt is None:
+        wt = _safe_float(price_snap.get("重量"))
+    norm = normalize_price_list_cost_fields(
+        _safe_float(price_snap.get("材料成本")),
+        _safe_float(price_snap.get("工费")),
+        _safe_float(price_snap.get("总成本")),
+        wt,
+        unit_hint=unit_hint_from_row(price_snap),
+    )
+    piece = norm.get("total_piece")
+    per_kg = norm.get("total_per_kg")
+    raw_total = _safe_float(price_snap.get("总成本"))
+    if piece is None and raw_total is not None:
+        if norm.get("costs_are_per_piece"):
+            piece = raw_total
+            per_kg = raw_total / wt if wt and wt > 0 else None
+        elif wt and wt > 0:
+            per_kg = raw_total
+            piece = raw_total * wt
+        else:
+            piece = raw_total
+            per_kg = raw_total
+    list_unit = "元/件" if norm.get("costs_are_per_piece") else "元/KG"
+    return {
+        "基准产品价格": round(piece, 4) if piece is not None else None,
+        "基准产品价格_每公斤": round(per_kg, 4) if per_kg is not None else None,
+        "清单材料工费口径": list_unit,
+    }
+
+
 def dedupe_warnings(warnings: list[str]) -> list[str]:
     """按完整文案去重，保留首次出现顺序。"""
     return list(dict.fromkeys(warnings))
+
+
+def _infer_total_per_kg_when_mat_labor_missing(
+    total_f: float,
+    weight_kg: float | None,
+    *,
+    unit_hint: UnitHint | str | None = None,
+) -> float | None:
+    """
+    仅总成本列可用时推断 元/kg：与 normalize 共用「>阈值≈元/件」启发式。
+    无有效重量且 total 像整件价时返回 None，避免回测量纲混乱。
+    """
+    if total_f <= 1e-12:
+        return None
+    wt = _safe_float(weight_kg)
+    has_wt = wt is not None and wt > 1e-12
+    uh = _resolve_cost_unit_hint(unit_hint)
+    threshold = _per_piece_total_threshold_yuan()
+    if uh == "kg":
+        return float(total_f)
+    if uh == "piece":
+        if has_wt:
+            return float(total_f) / float(wt)
+        return None
+    if has_wt:
+        if total_f > threshold:
+            return float(total_f) / float(wt)
+        return float(total_f)
+    if total_f > threshold:
+        return None
+    return float(total_f)
 
 
 def actual_price_per_kg_from_price_row(
@@ -316,26 +618,65 @@ def actual_price_per_kg_from_price_row(
     labor: Any,
     total: Any,
     weight_kg: Any,
+    *,
+    unit_hint: UnitHint | str | None = None,
 ) -> float | None:
     """将价格清单一行中的材料+工费/总成本统一为 元/kg（与主预测量纲一致）。"""
     mat_f = _safe_float(mat)
     labor_f = _safe_float(labor)
     total_f = _safe_float(total)
     wt = _safe_float(weight_kg)
+    uh = _resolve_cost_unit_hint(unit_hint)
     if mat_f is not None and labor_f is not None:
-        norm = normalize_price_list_cost_fields(mat_f, labor_f, total_f, wt)
+        norm = normalize_price_list_cost_fields(
+            mat_f, labor_f, total_f, wt, unit_hint=uh
+        )
         per_kg = norm.get("total_per_kg")
         if per_kg is not None and per_kg > 1e-12:
             return float(per_kg)
     if total_f is not None and total_f > 1e-12:
-        norm = normalize_price_list_cost_fields(None, None, total_f, wt)
-        per_kg = norm.get("total_per_kg")
-        if per_kg is not None and per_kg > 1e-12:
-            return float(per_kg)
-        if norm.get("costs_are_per_piece") and wt and wt > 0:
-            return float(total_f) / wt
-        return float(total_f)
+        inferred = _infer_total_per_kg_when_mat_labor_missing(
+            total_f, wt, unit_hint=uh
+        )
+        if inferred is not None and inferred > 1e-12:
+            return inferred
     return None
+
+
+def _cost_structure_bases(base_data: dict) -> tuple[float, float, bool]:
+    """按清单口径取材料/工费基准，避免元/件字段误入元/kg 分支。"""
+    per_piece = bool(base_data.get("costs_are_per_piece"))
+    if per_piece:
+        mat = base_data.get("base_mat_piece")
+        labor = base_data.get("base_labor_piece")
+        if mat is None:
+            mat = base_data.get("base_mat")
+        if labor is None:
+            labor = base_data.get("base_labor")
+    else:
+        mat = base_data.get("base_mat_per_kg")
+        labor = base_data.get("base_labor_per_kg")
+        if mat is None:
+            mat = base_data.get("base_mat")
+        if labor is None:
+            labor = base_data.get("base_labor")
+    return float(mat), float(labor), per_piece
+
+
+def _sum_bom_from_latest_bom(
+    lb: pd.DataFrame,
+    unit_for_row: Any,
+) -> float:
+    """与预测循环一致：对 latest_bom 各行 用量×单价 求和。"""
+    total = 0.0
+    for _, row in lb.iterrows():
+        qty = float(row.get("组件数量") or 0.0)
+        if qty <= 0:
+            continue
+        mid = str(row.get("材料编码") or "").strip()
+        unit = float(unit_for_row(mid, row))
+        total += qty * unit
+    return total
 
 
 def cost_structure_predict(
@@ -452,11 +793,22 @@ def build_product_cost_history(raw_pl: pl.DataFrame) -> dict[str, list[dict[str,
     )
 
     if COL_CREATEDATE in df.columns:
+        # 向量化替代 map_elements(calendar_date_key_yyyymmdd)：
+        # 1. cast→String 兼容 Int/Date/Datetime/String 列
+        # 2. 去掉末尾 ".0"（整数被 pandas 读为浮点时出现）
+        # 3. 去掉所有非数字字符（处理 "2026-01-07" 等带分隔符格式）
+        # 4. 取前 8 位；长度不足 8 则回退 "snapshot"
         dk_expr = (
             pl.col(COL_CREATEDATE)
-            .map_elements(
-                lambda v: calendar_date_key_yyyymmdd(v) or "snapshot",
-                return_dtype=pl.Utf8,
+            .cast(pl.String)
+            .str.strip_chars()
+            .str.replace(r"\.0$", "")
+            .str.replace_all(r"[^\d]", "")
+            .str.slice(0, 8)
+            .pipe(
+                lambda e: pl.when(e.str.len_chars() == 8)
+                .then(e)
+                .otherwise(pl.lit("snapshot"))
             )
             .alias("_dk")
         )
@@ -483,8 +835,11 @@ def build_product_cost_history(raw_pl: pl.DataFrame) -> dict[str, list[dict[str,
     version_daily = base.group_by([COL_PRODUCT, "_qv", "_dk"]).agg(
         pl.col("_line").sum().alias("_line")
     )
-    bom_by_day = version_daily.group_by([COL_PRODUCT, "_dk"]).agg(
-        pl.col("_line").mean().alias("bom_material")
+    # 同日多报价版本：取排序后最后一条（最新报价），避免对版本做均值稀释
+    bom_by_day = (
+        version_daily.sort([COL_PRODUCT, "_dk", "_qv"], nulls_last=True)
+        .group_by([COL_PRODUCT, "_dk"])
+        .agg(pl.col("_line").last().alias("bom_material"))
     )
 
     meta_cols = [c for c in ("产品价格", "材料成本", "工费", "重量") if c in base.columns]
@@ -570,7 +925,7 @@ def build_product_price_timeline(price_path: Path) -> dict[str, dict[str, dict[s
     产品价格历史清单：每一行表示「某产品、某报价月份、某重量(kg)」下的
     **材料成本、工费、总成本（均为 元/KG）**。时间轴优先用 **报价月份**（YYYYMM）。
     """
-    price = pd.read_excel(price_path, sheet_name=0)
+    price = read_price_excel(price_path)
     if COL_PRODUCT not in price.columns:
         if "ZMATNR" in price.columns:
             price = price.rename(columns={"ZMATNR": COL_PRODUCT})
@@ -673,23 +1028,25 @@ def expand_product_cost_history_dict(
     all_products = set(product_bom.keys()) | set(product_cost_history.keys()) | set(ppt.keys())
     out: dict[str, list[dict[str, Any]]] = dict(product_cost_history)
 
-    for product in all_products:
-        bom_rows = product_bom.get(product) or []
+    static_bom: dict[str, float] = {}
+    for product, bom_rows in product_bom.items():
         if not bom_rows:
             continue
-        menges: dict[str, float] = {}
-        defaults: dict[str, float] = {}
+        total = 0.0
         for r in bom_rows:
             c = str(r.get("组件编码") or "").strip()
             if not c:
                 continue
-            menges[c] = float(r.get("MENGE合计") or 0)
-            defaults[c] = float(r.get("组件单价") or 0)
+            qty = float(r.get("MENGE合计") or 0)
+            if qty <= 0:
+                continue
+            total += qty * float(r.get("组件单价") or 0)
+        if total > 1e-12:
+            static_bom[product] = total
 
-        bom_material_static = sum(
-            menges[c] * defaults.get(c, 0.0) for c in menges if menges[c] > 0
-        )
-        if bom_material_static <= 1e-12:
+    for product in all_products:
+        bom_material_static = static_bom.get(product)
+        if not bom_material_static:
             continue
 
         existing = {
@@ -775,6 +1132,8 @@ def _regression_fit_grade(r2: float, n: int) -> str:
     """回归拟合效果文字等级（供页面展示）。"""
     if n < 3:
         return "未启用"
+    if r2 < 0:
+        return "无效"
     if r2 >= 0.7:
         return "优"
     if r2 >= 0.35:
@@ -811,7 +1170,7 @@ def _linear_fit_predict(
     ss_res = float(np.sum((y - y_hat) ** 2))
     ss_tot = float(np.sum((y - np.mean(y)) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
-    r2 = max(0.0, min(1.0, r2))
+    r2 = min(1.0, float(r2))
     return pred, r2, n, intercept, slope
 
 
@@ -882,7 +1241,7 @@ def _filter_slopes_mad(
     arr = np.array(slopes, dtype=float)
     med = float(np.median(arr))
     mad = float(np.median(np.abs(arr - med)))
-    if mad < 1e-12:
+    if mad / max(abs(med), 1e-9) < 1e-6:
         return slopes, weights
     keep = np.abs(arr - med) <= SLOPE_MAD_K * mad
     if not keep.any():
@@ -923,9 +1282,20 @@ def _robust_slopes_from_points(
             if not math.isfinite(s):
                 continue
             slopes.append(float(s))
-            if use_decay and latest_mi is not None and month_idxs[j] is not None:
-                months_ago = max(0, latest_mi - month_idxs[j])
-                weights.append(math.exp(-TIME_DECAY_LAMBDA * months_ago))
+            if use_decay and latest_mi is not None:
+                mi_i, mi_j = month_idxs[i], month_idxs[j]
+                if mi_i is not None and mi_j is not None:
+                    avg_months_ago = (
+                        (latest_mi - mi_i) + (latest_mi - mi_j)
+                    ) / 2.0
+                    weights.append(
+                        math.exp(-TIME_DECAY_LAMBDA * max(0.0, avg_months_ago))
+                    )
+                elif month_idxs[j] is not None:
+                    months_ago = max(0, latest_mi - month_idxs[j])
+                    weights.append(math.exp(-TIME_DECAY_LAMBDA * months_ago))
+                else:
+                    weights.append(1.0)
             elif use_decay:
                 weights.append(1.0)
 
@@ -954,6 +1324,45 @@ def _pass_through_from_records(
     }
 
 
+def _conduction_coeff_clip_bounds(weight_kg: float | None) -> tuple[float, float]:
+    """按产品重量收紧传导系数 (元/kg)/(元/件) 的裁剪区间。"""
+    lo, hi = CONDUCTION_COEFF_ABS_MIN, CONDUCTION_COEFF_ABS_MAX
+    if weight_kg is not None and weight_kg > 1e-12:
+        w = float(weight_kg)
+        hi = min(hi, 2.0 / w)
+        lo = max(lo, min(0.02, 0.05 / w))
+        if lo > hi:
+            lo = hi * 0.5
+    return lo, hi
+
+
+def _reservoir_add_slopes(
+    pooled: list[float],
+    pooled_w: list[float],
+    new_slopes: list[float],
+    new_w: list[float] | None,
+    *,
+    max_size: int,
+    seen: int,
+) -> int:
+    """将新斜率流式并入池；超过 max_size 时用 reservoir 抽样，避免偏向前序产品。"""
+    paired_w = bool(new_w) and len(new_w) == len(new_slopes)
+    for idx, s in enumerate(new_slopes):
+        seen += 1
+        wv = float(new_w[idx]) if paired_w else None
+        if len(pooled) < max_size:
+            pooled.append(s)
+            if paired_w and wv is not None:
+                pooled_w.append(wv)
+        else:
+            j = random.randint(0, seen - 1)
+            if j < max_size:
+                pooled[j] = s
+                if paired_w and wv is not None and j < len(pooled_w):
+                    pooled_w[j] = wv
+    return seen
+
+
 def _pool_slopes_from_history(
     all_history: dict[str, list[dict]] | None,
     *,
@@ -964,6 +1373,7 @@ def _pool_slopes_from_history(
     pooled_w: list[float] = []
     n_points = 0
     n_products = 0
+    seen = 0
     for pid, records in (all_history or {}).items():
         if product_filter is not None and not product_filter(pid):
             continue
@@ -973,11 +1383,16 @@ def _pool_slopes_from_history(
         n_products += 1
         n_points += len(pts)
         slopes, w = _robust_slopes_from_points(pts)
-        pooled.extend(slopes)
-        if w:
-            pooled_w.extend(w)
-        if len(pooled) >= 5000:
-            break
+        if not slopes:
+            continue
+        seen = _reservoir_add_slopes(
+            pooled,
+            pooled_w,
+            slopes,
+            w,
+            max_size=SLOPE_POOL_MAX,
+            seen=seen,
+        )
     pooled, pooled_w = _filter_slopes_mad(pooled, pooled_w if pooled_w else None)
     return pooled, pooled_w, n_points, n_products
 
@@ -1211,6 +1626,7 @@ def _predict_product_price_legacy(
         _safe_float(labor_snap),
         _safe_float(total_snap),
         weight_kg,
+        unit_hint=unit_hint_from_row(price_snap),
     )
     mat_piece = cost_norm.get("mat_piece")
     labor_piece = cost_norm.get("labor_piece")
@@ -1644,14 +2060,12 @@ def _point_per_kg_from_sim_bom(
         else float(base_data.get("base_bom_total") or 0.0)
     )
     if has_cost_structure and base_bom_total > 1e-12:
-        base_mat = base_data.get("base_mat_piece") or base_data["base_mat"]
-        base_labor = base_data.get("base_labor_piece") or base_data["base_labor"]
-        per_piece = bool(base_data.get("costs_are_per_piece"))
+        base_mat, base_labor, per_piece = _cost_structure_bases(base_data)
         weight = base_data.get("weight")
         ratio = sim_bom / base_bom_total
         _, per_kg = cost_structure_predict(
-            float(base_mat),
-            float(base_labor),
+            base_mat,
+            base_labor,
             ratio,
             weight if weight and not math.isnan(weight) else None,
             costs_are_per_piece=per_piece,
@@ -1695,10 +2109,14 @@ def _compute_sensitivity_analysis(
     if not user_modified_prices:
         return []
 
-    base_bom_total = float(base_data.get("base_bom_total") or 0.0)
+    base_bom_total = float(
+        base_data.get("baseline_bom_for_ratio")
+        or base_data.get("base_bom_total")
+        or 0.0
+    )
     base_mat = base_data.get("base_mat")
     sim_bom_center = _sim_bom_from_component_info(component_info)
-    ratio_base = sim_bom_center if sim_bom_center > 1e-12 else base_bom_total
+    ratio_base = max(base_bom_total, MIN_BASE_AMOUNT_YUAN)
 
     denom_ppk = float(point_per_kg) if point_per_kg and point_per_kg > 1e-12 else None
     if denom_ppk is None:
@@ -1708,7 +2126,7 @@ def _compute_sensitivity_analysis(
             base_data=base_data,
             coeff=coeff,
             base_for_coeff=base_for_coeff,
-            base_bom_total_override=sim_bom_center,
+            base_bom_total_override=ratio_base,
         )
     if denom_ppk is None or denom_ppk <= 1e-12:
         return []
@@ -1735,7 +2153,7 @@ def _compute_sensitivity_analysis(
             base_data=base_data,
             coeff=coeff,
             base_for_coeff=base_for_coeff,
-            base_bom_total_override=sim_bom_center,
+            base_bom_total_override=ratio_base,
         )
         ppk_hi = _point_per_kg_from_sim_bom(
             bom_hi,
@@ -1743,7 +2161,7 @@ def _compute_sensitivity_analysis(
             base_data=base_data,
             coeff=coeff,
             base_for_coeff=base_for_coeff,
-            base_bom_total_override=sim_bom_center,
+            base_bom_total_override=ratio_base,
         )
         if ppk_lo is None or ppk_hi is None:
             continue
@@ -1834,7 +2252,14 @@ def _compute_sensitivity_grid(
                 base_data=base_data,
                 coeff=coeff,
                 base_for_coeff=base_for_coeff,
-                base_bom_total_override=_sim_bom_from_component_info(component_info),
+                base_bom_total_override=max(
+                    float(
+                        base_data.get("baseline_bom_for_ratio")
+                        or base_data.get("base_bom_total")
+                        or 0.0
+                    ),
+                    MIN_BASE_AMOUNT_YUAN,
+                ),
             )
             row_vals.append(round(float(ppk), 4) if ppk is not None else None)
         matrix.append(row_vals)
@@ -1977,8 +2402,9 @@ def _compute_historical_model_error(
         wt_t = row.get("重量") if "重量" in row.index else default_weight
         if wt_t is None or (isinstance(wt_t, float) and math.isnan(wt_t)):
             wt_t = default_weight
+        row_uh = unit_hint_from_row(row)
         norm = normalize_price_list_cost_fields(
-            float(mat_t), 0.0, None, _safe_float(wt_t)
+            float(mat_t), 0.0, None, _safe_float(wt_t), unit_hint=row_uh
         )
         mk = norm.get("mat_per_kg")
         if mk is not None and mk > 1e-12:
@@ -2018,24 +2444,75 @@ def _compute_historical_model_error(
     }
 
 
-def _model_error_interval(point_per_kg: float, model_error: dict[str, Any]) -> dict[str, Any]:
-    """由稳健 MAE 构造点估计 ± Z×MAE 区间（元/kg）。"""
+def _model_error_interval(
+    point_per_kg: float,
+    model_error: dict[str, Any],
+    *,
+    bom_perturbation_ratio: float = 0.0,
+) -> dict[str, Any]:
+    """
+    由稳健 MAE 构造点估计区间（元/kg）。
+    半宽 = Z×MAE×(1 + γ×|ΔBOM|/基准BOM)，模拟调价幅度越大区间越宽。
+    """
     if not model_error.get("可用") or point_per_kg is None:
         return model_error
     mae = float(model_error.get("MAE") or model_error.get("RMSE") or 0.0)
     z = MODEL_ERROR_Z
-    half = z * mae
+    gamma = MODEL_ERROR_GAMMA
+    perturb = max(0.0, float(bom_perturbation_ratio))
+    interval_scale = 1.0 + gamma * perturb
+    half = z * mae * interval_scale
     lo = max(0.0, point_per_kg - half)
     hi = point_per_kg + half
     out = dict(model_error)
     out["预测区间_kg"] = [round(lo, 4), round(hi, 4)]
     out["区间半宽"] = round(half, 4)
+    out["BOM扰动比例"] = round(perturb, 6)
+    out["区间放大系数"] = round(interval_scale, 4)
+    out["区间口径"] = (
+        f"点估计 ± {z}×MAE×(1+{gamma}×|ΔBOM|/基准BOM)"
+        if perturb > 1e-9
+        else f"点估计 ± {z}×MAE（稳健）"
+    )
     return out
+
+def latest_bom_snapshot_from_rows(
+    product_id: str,
+    rows: list[dict],
+) -> pd.DataFrame:
+    """将 BI 页 BOM 表格行转为预测用快照，保证与页面展示的组件列表一致。"""
+    pid = norm_material_code_scalar(product_id)
+    recs: list[dict[str, Any]] = []
+    for r in rows or []:
+        comp = str(r.get("组件编码") or "").strip()
+        if not comp:
+            continue
+        try:
+            qty = float(r.get("MENGE合计") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        try:
+            unit = float(r.get("组件单价") or 0)
+        except (TypeError, ValueError):
+            unit = 0.0
+        name = str(r.get("组件名称") or r.get("MAKTX") or comp)
+        recs.append({
+            COL_PRODUCT: pid,
+            COL_COMPONENT: comp,
+            COL_QTY: qty,
+            COL_UNIT_PRICE: unit,
+            COL_MAKTX: name,
+            COL_CREATEDATE: "snapshot",
+        })
+    return pd.DataFrame(recs) if recs else pd.DataFrame()
+
 
 def _prepare_base_data(
     product_id,
     bom_df: pd.DataFrame,
     price_df: pd.DataFrame,
+    *,
+    latest_bom_snapshot: pd.DataFrame | None = None,
 ) -> "tuple[dict | None, str | None]":
     """
     从 BOM 历史与产品价格历史中提取预测所需的基准数据。
@@ -2090,19 +2567,39 @@ def _prepare_base_data(
     else:
         b_hist["_date"] = "00000000"
 
-    latest_date = b_hist["_date"].max()
-    latest_bom_raw = b_hist[b_hist["_date"] == latest_date].copy()
+    if latest_bom_snapshot is not None and not latest_bom_snapshot.empty:
+        latest_bom_raw = latest_bom_snapshot.copy()
+        latest_bom_raw[COL_QTY] = pd.to_numeric(
+            latest_bom_raw[COL_QTY], errors="coerce"
+        ).fillna(0.0)
+        latest_bom_raw[COL_UNIT_PRICE] = pd.to_numeric(
+            latest_bom_raw[COL_UNIT_PRICE], errors="coerce"
+        ).fillna(0.0)
+    else:
+        latest_date = _latest_valid_bom_date(b_hist["_date"])
+        latest_bom_raw = b_hist[b_hist["_date"] == latest_date].copy()
 
     # ── 组件历史统计 ──────────────────────────────────────────────────────
     maktx_col = COL_MAKTX if COL_MAKTX in b_hist.columns else COL_COMPONENT
-    comp_group = b_hist.groupby([COL_COMPONENT, maktx_col], sort=False)[COL_UNIT_PRICE]
-    comp_stats = comp_group.agg(
-        历史均价="mean",
-        历史std="std",
-        历史样本数="count",
-        历史最低="min",
-        历史最高="max",
-    ).reset_index().rename(columns={COL_COMPONENT: "材料编码", maktx_col: "材料型号"})
+    if maktx_col == COL_COMPONENT:
+        comp_group = b_hist.groupby(COL_COMPONENT, sort=False)[COL_UNIT_PRICE]
+        comp_stats = comp_group.agg(
+            历史均价="mean",
+            历史std="std",
+            历史样本数="count",
+            历史最低="min",
+            历史最高="max",
+        ).reset_index().rename(columns={COL_COMPONENT: "材料编码"})
+        comp_stats["材料型号"] = comp_stats["材料编码"]
+    else:
+        comp_group = b_hist.groupby([COL_COMPONENT, maktx_col], sort=False)[COL_UNIT_PRICE]
+        comp_stats = comp_group.agg(
+            历史均价="mean",
+            历史std="std",
+            历史样本数="count",
+            历史最低="min",
+            历史最高="max",
+        ).reset_index().rename(columns={COL_COMPONENT: "材料编码", maktx_col: "材料型号"})
     comp_stats["材料编码"] = norm_material_code(comp_stats["材料编码"])
     comp_stats["历史std"] = comp_stats["历史std"].fillna(comp_stats["历史均价"] * 0.05)
 
@@ -2126,13 +2623,17 @@ def _prepare_base_data(
     base_bom_total = float(np.dot(lb_qty, lb_unit_prices))
 
     # ── 构建标准化的 latest_bom DataFrame ────────────────────────────────
-    latest_bom = latest_bom_raw[[COL_COMPONENT, maktx_col, COL_QTY, COL_UNIT_PRICE]].copy()
-    latest_bom["材料编码"] = norm_material_code(latest_bom[COL_COMPONENT])
-    latest_bom = latest_bom.rename(columns={
-        maktx_col: "材料型号",
-        COL_QTY: "组件数量",
-        COL_UNIT_PRICE: "材料单价",
-    }).drop(columns=[COL_COMPONENT], errors="ignore")
+    name_col = (
+        latest_bom_raw[COL_MAKTX]
+        if COL_MAKTX in latest_bom_raw.columns and maktx_col != COL_COMPONENT
+        else latest_bom_raw[COL_COMPONENT]
+    )
+    latest_bom = pd.DataFrame({
+        "材料编码": norm_material_code(latest_bom_raw[COL_COMPONENT]),
+        "材料型号": name_col.astype(str),
+        "组件数量": latest_bom_raw[COL_QTY].values,
+        "材料单价": latest_bom_raw[COL_UNIT_PRICE].values,
+    })
 
     # ── 从 latest_price 提取基准成本字段 ─────────────────────────────────
     def _get_num(row, col):
@@ -2149,13 +2650,16 @@ def _prepare_base_data(
     base_labor = _get_num(latest_price, "工费")
     base_total = _get_num(latest_price, "总成本")
 
-    # ── 构建 p_hist 供传导系数使用（需要 报价月份 & 材料成本） ─────────────
-    p_hist_coeff = p_hist[["_qm"] + [c for c in ["材料成本"] if c in p_hist.columns]].copy()
+    # ── 构建 p_hist 供传导系数使用（报价月份、材料成本、重量） ─────────────
+    coeff_cols = ["_qm", "材料成本", "重量"]
+    p_hist_coeff = p_hist[
+        ["_qm"] + [c for c in coeff_cols[1:] if c in p_hist.columns]
+    ].copy()
     p_hist_coeff = p_hist_coeff.rename(columns={"_qm": "报价月份"})
     if "材料成本" not in p_hist_coeff.columns:
         p_hist_coeff["材料成本"] = float("nan")
 
-    # 完整价格序列（供历史回测 MAE；含重量以便元/件 → 元/kg）
+    # 完整价格序列（供历史回测 MAE、传导系数；含重量以便元/件 → 元/kg）
     p_hist_full_cols = ["_qm"] + [
         c for c in ("材料成本", "工费", "总成本", "重量") if c in p_hist.columns
     ]
@@ -2164,11 +2668,27 @@ def _prepare_base_data(
         if c in p_hist_full.columns:
             p_hist_full[c] = pd.to_numeric(p_hist_full[c], errors="coerce")
 
+    price_uh = unit_hint_from_row(latest_price)
+    bom_uh = unit_hint_from_bom_dataframe(bom_df, pid_str)
+    sum_ml = (
+        (0.0 if math.isnan(base_mat) else base_mat)
+        + (0.0 if math.isnan(base_labor) else base_labor)
+    )
+    wt_for_uh = None if math.isnan(weight) else weight
+    total_for_uh = None if math.isnan(base_total) else base_total
+    if _price_list_values_imply_per_piece(sum_ml, total_for_uh, wt_for_uh):
+        cost_uh: UnitHint = "piece"
+    elif price_uh != "unknown":
+        cost_uh = price_uh
+    else:
+        cost_uh = bom_uh
+
     cost_norm = normalize_price_list_cost_fields(
         None if math.isnan(base_mat) else base_mat,
         None if math.isnan(base_labor) else base_labor,
         None if math.isnan(base_total) else base_total,
         None if math.isnan(weight) else weight,
+        unit_hint=cost_uh,
     )
 
     return {
@@ -2189,43 +2709,73 @@ def _prepare_base_data(
         "base_labor_piece": cost_norm.get("labor_piece"),
         "base_total_piece": cost_norm.get("total_piece"),
         "base_total_per_kg": cost_norm.get("total_per_kg"),
+        "base_mat_per_kg": cost_norm.get("mat_per_kg"),
+        "base_labor_per_kg": cost_norm.get("labor_per_kg"),
         "costs_are_per_piece": cost_norm.get("costs_are_per_piece"),
     }, None
 
 
 def _estimate_conduction_coeff(base_data: dict) -> "tuple[float, str]":
     """
-    用历史月度数据估计：产品材料成本 随 BOM批次合计 的变化率。
-    复用 Theil-Sen 风格稳健斜率（_robust_slopes_from_points），系数区间随样本自适应。
+    用历史月度数据估计材料成本(元/kg)对 BOM 材料合计(元/件)的传导系数。
+
+    回归优先将 BOM 批次合计 ÷ 当月重量 换算为 元/kg，与材料成本同量纲；
+    无重量时退回 元/件 BOM × 材料成本(元/kg)，系数量纲为 1/kg，与
+    predict 中「Δ价/kg = coeff × ΔBOM/件」一致。
     返回 (稳健传导系数, 样本质量评级)。
     """
     fallback = 0.030
-    abs_min, abs_max = 0.005, 0.15
 
     bom_m = base_data["bom_monthly"]
     p_h = base_data["p_hist"]
-
-    merged = bom_m.merge(p_h[["报价月份", "材料成本"]], on="报价月份", how="inner")
+    weight_col = "重量" if "重量" in p_h.columns else None
+    merge_cols = ["报价月份", "材料成本"] + ([weight_col] if weight_col else [])
+    merged = bom_m.merge(p_h[merge_cols], on="报价月份", how="inner")
     merged = merged.dropna(subset=["材料成本", "BOM批次合计"])
     merged = merged.sort_values("报价月份")
 
     if len(merged) < 3:
         return fallback, "global_fallback"
 
-    points = [
-        (
-            str(r["报价月份"]),
-            float(r["BOM批次合计"]),
-            float(r["材料成本"]),
-        )
-        for _, r in merged.iterrows()
-        if float(r["BOM批次合计"]) > 1e-12 and float(r["材料成本"]) > 1e-12
-    ]
+    points: list[tuple[str, float, float]] = []
+    month_weights: list[float] = []
+    for _, r in merged.iterrows():
+        bom_piece = float(r["BOM批次合计"])
+        mat_kg = float(r["材料成本"])
+        if bom_piece <= 1e-12 or mat_kg <= 1e-12:
+            continue
+        wt = None
+        if weight_col:
+            try:
+                w = float(r.get(weight_col))
+                if w > 1e-12:
+                    wt = w
+            except (TypeError, ValueError):
+                pass
+        if wt:
+            x = bom_piece / wt
+            month_weights.append(wt)
+        else:
+            x = bom_piece
+        points.append((str(r["报价月份"]), x, mat_kg))
     slopes, slope_weights = _robust_slopes_from_points(points)
     if len(slopes) < 2:
         return fallback, "global_fallback"
 
     coeff = _aggregate_slopes(slopes, slope_weights)
+    # 同量纲(元/kg)回归 → 无量纲斜率；换算为 predict 用的 (元/kg)/(元/件)=1/kg
+    w_ref: float | None = None
+    if month_weights:
+        w_ref = float(np.median(month_weights))
+        if w_ref > 1e-12:
+            coeff = coeff / w_ref
+    if w_ref is None:
+        bw = base_data.get("weight")
+        try:
+            w_ref = float(bw) if bw is not None and not math.isnan(float(bw)) else None
+        except (TypeError, ValueError):
+            w_ref = None
+    abs_min, abs_max = _conduction_coeff_clip_bounds(w_ref)
     if len(slopes) >= 5:
         lo, hi = np.nanpercentile(slopes, [5, 95])
         lo = max(abs_min, float(lo))
@@ -2245,6 +2795,7 @@ def predict_product_price(
     price_df: "pd.DataFrame | None",
     *,
     reference_prices: dict | None = None,
+    latest_bom_snapshot: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """
     成本预测主函数（四级优先级 + 敏感性分析 + 历史回测误差区间）。
@@ -2261,7 +2812,12 @@ def predict_product_price(
     dict：method、point_estimate、point_per_kg、confidence_score、warnings、
     sensitivity（改价组件 ±10% 敏感性）、model_error（历史回测 RMSE 与 ±2σ 区间，与调价无关）。
     """
-    base_data, err = _prepare_base_data(product_id, bom_df, price_df)
+    base_data, err = _prepare_base_data(
+        product_id,
+        bom_df,
+        price_df,
+        latest_bom_snapshot=latest_bom_snapshot,
+    )
     if base_data is None:
         return {"error": err}
 
@@ -2276,15 +2832,19 @@ def predict_product_price(
         for k, v in (reference_prices or {}).items()
         if str(k).strip()
     }
+    catalog_bom_total = _sum_bom_from_latest_bom(
+        lb,
+        lambda mid, row: float(row.get("材料单价") or 0.0),
+    )
     if ref_map:
-        base_bom_total = 0.0
-        for _, row in lb.iterrows():
-            mid = str(row["材料编码"]).strip()
-            qty = float(row.get("组件数量") or 0.0)
-            unit = ref_map.get(mid, float(row.get("材料单价") or 0.0))
-            base_bom_total += qty * unit
+        base_bom_total = _sum_bom_from_latest_bom(
+            lb,
+            lambda mid, row: ref_map.get(
+                mid, float(row.get("材料单价") or 0.0)
+            ),
+        )
     else:
-        base_bom_total = float(base_data["base_bom_total"])
+        base_bom_total = catalog_bom_total
 
     overrides = {
         str(k).strip(): float(v) for k, v in user_modified_prices.items() if str(k).strip()
@@ -2317,48 +2877,119 @@ def predict_product_price(
             new_price = ref_unit
             is_fixed = False
 
-        if stat is not None and is_fixed and ref_unit >= LOW_VALUE_UNIT_PRICE_YUAN:
+        if is_fixed:
+            ref_mult = new_price / max(ref_unit, LOW_VALUE_UNIT_PRICE_YUAN)
+            cap, cred_msg, _r_lbl = _credibility_cap_from_ref_multiple(ref_mult)
+            if cap is not None and cred_msg:
+                score = min(score, cap)
+                emoji = "🚨" if cap <= 20 else "⚠️"
+                warnings.append(f"{emoji} 【{mat_name}】{cred_msg}")
+                if cap <= 20:
+                    warnings.append(
+                        f"🚨 【{mat_name}】预测结果不具参考价值"
+                    )
+                material_warned.add(mat_name)
+
+        if (
+            stat is not None
+            and is_fixed
+            and ref_unit >= LOW_VALUE_UNIT_PRICE_YUAN
+            and mat_name not in material_warned
+        ):
             hist_mean_chk = float(stat["历史均价"])
             hist_min = float(stat["历史最低"])
             hist_max = float(stat["历史最高"])
             hist_std_chk = float(stat["历史std"])
             hist_mean_eff = max(hist_mean_chk, LOW_VALUE_UNIT_PRICE_YUAN)
+            # 改价后用模拟单价估算行占比，避免「单价低但模拟后行成本很大」被误判为非核心
+            unit_for_share = new_price if is_fixed else ref_unit
+            line_share = (quantity * unit_for_share) / max(
+                base_bom_total, MIN_BASE_AMOUNT_YUAN
+            )
+            is_non_core = line_share < SHOCK_NON_CORE_BOM_SHARE
+            abs_delta = abs(new_price - hist_mean_chk)
+            rel_ratio = abs_delta / hist_mean_eff
+            mild_abs_move = (
+                abs_delta < SHOCK_ABS_DELTA_CAP_YUAN and rel_ratio < 2.0
+            )
 
-            if hist_std_chk > 0 and mat_name not in material_warned:
-                shock_sigma = abs(new_price - hist_mean_chk) / hist_std_chk
-                if shock_sigma > 10.0:
-                    score = min(score, 20)
-                    warnings.append(
-                        f"🚨 【{mat_name}】调价幅度 {shock_sigma:.1f}σ，属于极端异常值，"
-                        f"预测结果不具有参考意义（历史均价 {hist_mean_chk:.2f}，"
-                        f"历史区间 [{hist_min:.2f}, {hist_max:.2f}]）"
-                    )
-                    material_warned.add(mat_name)
-                elif shock_sigma > 5.0:
-                    score = min(score, 50)
-                    warnings.append(
-                        f"⚠️ 【{mat_name}】调价幅度 {shock_sigma:.1f}σ，远超历史范围，可信度极低"
-                    )
-                    material_warned.add(mat_name)
-                elif shock_sigma > 3.0:
-                    score = min(score, 75)
-                    warnings.append(
-                        f"⚠️ 【{mat_name}】调价幅度 {shock_sigma:.1f}σ，超出历史波动范围"
-                    )
-                    material_warned.add(mat_name)
-                elif shock_sigma > 2.0:
-                    score = min(score, 92)
+            if hist_std_chk > 0 and not is_non_core:
+                std_eff = max(
+                    hist_std_chk,
+                    SHOCK_MIN_EFFECTIVE_STD_YUAN,
+                    hist_mean_chk * 0.05,
+                )
+                shock_sigma = abs_delta / std_eff
+                use_rel_for_low_unit = ref_unit < LOW_VALUE_REL_SIGMA_UNIT_YUAN
 
-            if hist_mean_eff > LOW_VALUE_UNIT_PRICE_YUAN and mat_name not in material_warned:
-                abs_ratio = abs(new_price - hist_mean_chk) / hist_mean_eff
-                if abs_ratio > 5.0:
-                    score = min(score, 15)
-                    warnings.append(
-                        f"🚨 【{mat_name}】模拟单价（{new_price:.2f}）为历史均价（{hist_mean_chk:.2f}）"
-                        f"的 {abs_ratio + 1:.0f} 倍，预测结果不具参考价值"
+                if use_rel_for_low_unit:
+                    cap_lu, cred_msg_lu, _r_lu = _credibility_cap_from_ref_multiple(
+                        ref_mult
                     )
+                    if cap_lu is not None and cred_msg_lu:
+                        score = min(score, cap_lu)
+                        emoji_lu = "🚨" if cap_lu <= 20 else "⚠️"
+                        warnings.append(f"{emoji_lu} 【{mat_name}】{cred_msg_lu}")
+                        if cap_lu <= 20:
+                            warnings.append(
+                                f"🚨 【{mat_name}】预测结果不具参考价值"
+                            )
+                        material_warned.add(mat_name)
+                    elif rel_ratio > 2.0 and (
+                        _ref_multiple_magnitude(ref_mult) or 0
+                    ) <= CREDIBILITY_REF_NORMAL_MAX:
+                        score = min(score, 92)
+                        warnings.append(
+                            f"⚠️ 【{mat_name}】低单价辅料调价相对历史均价 {rel_ratio:.0%}，"
+                            f"请关注波动"
+                        )
+                        material_warned.add(mat_name)
+                elif not mild_abs_move:
+                    if shock_sigma > 10.0:
+                        score = min(score, 20)
+                        warnings.append(
+                            f"🚨 【{mat_name}】调价幅度 {shock_sigma:.1f}σ，属于极端异常值，"
+                            f"预测结果不具有参考意义（历史均价 {hist_mean_chk:.2f}，"
+                            f"历史区间 [{hist_min:.2f}, {hist_max:.2f}]）"
+                        )
+                        material_warned.add(mat_name)
+                    elif shock_sigma > 5.0:
+                        score = min(score, 50)
+                        warnings.append(
+                            f"⚠️ 【{mat_name}】调价幅度 {shock_sigma:.1f}σ，"
+                            f"远超历史范围，可信度极低"
+                        )
+                        material_warned.add(mat_name)
+                    elif shock_sigma > 3.0:
+                        score = min(score, 75)
+                        warnings.append(
+                            f"⚠️ 【{mat_name}】调价幅度 {shock_sigma:.1f}σ，"
+                            f"超出历史波动范围"
+                        )
+                        material_warned.add(mat_name)
+                    elif shock_sigma > 2.0:
+                        score = min(score, 92)
+
+            if (
+                hist_mean_eff > LOW_VALUE_UNIT_PRICE_YUAN
+                and mat_name not in material_warned
+                and not is_non_core
+            ):
+                cap_h, cred_msg_h, _r_h = _credibility_cap_from_ref_multiple(
+                    new_price / max(hist_mean_chk, LOW_VALUE_UNIT_PRICE_YUAN)
+                )
+                if cap_h is not None and cred_msg_h:
+                    score = min(score, cap_h)
+                    emoji_h = "🚨" if cap_h <= 20 else "⚠️"
+                    warnings.append(
+                        f"{emoji_h} 【{mat_name}】相对历史均价：{cred_msg_h}"
+                    )
+                    if cap_h <= 20:
+                        warnings.append(
+                            f"🚨 【{mat_name}】预测结果不具参考价值"
+                        )
                     material_warned.add(mat_name)
-                elif abs_ratio > 2.0:
+                elif rel_ratio > 2.0:
                     score = min(score, 45)
 
         sim_bom_point += quantity * new_price
@@ -2390,16 +3021,32 @@ def predict_product_price(
     if has_cost_structure:
         base_eff = max(base_bom_total, MIN_BASE_AMOUNT_YUAN)
         ratio = sim_bom_point / base_eff
-        mat_piece = base_data.get("base_mat_piece") or base_mat
-        labor_piece = base_data.get("base_labor_piece") or base_labor
-        per_piece = bool(base_data.get("costs_are_per_piece"))
+        mat_base, labor_base, per_piece = _cost_structure_bases(base_data)
         point_total, point_per_kg = cost_structure_predict(
-            float(mat_piece),
-            float(labor_piece),
+            mat_base,
+            labor_base,
             ratio,
             weight if weight and not math.isnan(weight) else None,
             costs_are_per_piece=per_piece,
         )
+        bl_kg = base_data.get("base_total_per_kg")
+        bom_perturb_early = abs(sim_bom_point - base_bom_total) / max(
+            base_bom_total, MIN_BASE_AMOUNT_YUAN
+        )
+        # 仅在「BOM 倍率不大但单价/kg 飙高」时提示元/件/元/kg 口径错乱，避免辅料调价误伤
+        if (
+            point_per_kg is not None
+            and bl_kg is not None
+            and not (isinstance(bl_kg, float) and math.isnan(bl_kg))
+            and float(bl_kg) > 1e-12
+            and float(point_per_kg) > float(bl_kg) * 4.0
+            and bom_perturb_early < 0.2
+        ):
+            warnings.append(
+                f"预测价({point_per_kg:.2f}元/kg)远高于清单基准({float(bl_kg):.2f}元/kg)，"
+                "请核对价格清单口径是否为元/件"
+            )
+            score = min(score, 40)
         if point_total is None:
             point_total = 0.0
         if point_per_kg is None:
@@ -2407,6 +3054,7 @@ def predict_product_price(
         method = "cost_structure_ratio"
     else:
         coeff, coeff_quality = _estimate_conduction_coeff(base_data)
+        # ΔBOM 为元/件；coeff 量纲 1/kg → Δ价/kg = coeff × ΔBOM/件
         delta_bom = sim_bom_point - base_bom_total
 
         _base_for_coeff = base_data.get("base_total_per_kg")
@@ -2427,6 +3075,8 @@ def predict_product_price(
 
         if base_bom_total <= 0:
             warnings.append("基准BOM合计为零（数据异常），已降级至传导系数模型")
+
+    base_data["baseline_bom_for_ratio"] = base_bom_total
 
     any_adjusted = any(c.get("is_fixed") for c in component_info)
     # 未改任何组件单价时，主结果与价格清单基准一致（避免加载 BOM 就出现虚假差额）
@@ -2465,18 +3115,25 @@ def predict_product_price(
         base_for_coeff=_base_for_coeff,
     )
 
-    # ── 步骤D：模型历史误差（回测 MAE + ±1.5×MAE，与用户调价无关）────────
+    # ── 步骤D：模型历史误差（回测 MAE；区间半宽随本次 ΔBOM 放大）────────
     model_error_raw = _compute_historical_model_error(
         base_data,
         has_cost_structure=has_cost_structure,
         coeff=coeff,
         base_for_coeff=_base_for_coeff,
     )
-    model_error = _model_error_interval(float(point_per_kg), model_error_raw)
+    bom_perturbation_ratio = abs(sim_bom_point - base_bom_total) / max(
+        base_bom_total, MIN_BASE_AMOUNT_YUAN
+    )
+    model_error = _model_error_interval(
+        float(point_per_kg),
+        model_error_raw,
+        bom_perturbation_ratio=bom_perturbation_ratio,
+    )
 
     # ── 步骤E：可信度评分修正项 ───────────────────────────────────────────
     n_price_months = base_data["n_price_months"]
-    if n_price_months >= 12:
+    if n_price_months >= 12 and score >= 95 and not material_warned:
         score = min(100, score + 5)
     elif n_price_months < 4:
         score = min(score, 85)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections import OrderedDict
 import math
 import os
 import re
@@ -27,6 +28,8 @@ import html
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import requests
 from pathlib import Path
 from datetime import datetime
 import sys
@@ -47,10 +50,15 @@ from process_excel import (
     sheet_price_history,
     normalize_columns,
     norm_material_code,
+    read_excel_as_polars,
+    read_price_excel,
     REQUIRED_COLS,
     COL_PRODUCT,
     COL_COMPONENT,
+    COL_QTY,
+    COL_UNIT,
     COL_UNIT_PRICE,
+    COL_MAKTX,
     COL_CREATEDATE,
     COL_CATEGORY,
     _write_sheet,
@@ -65,8 +73,8 @@ RESULT_DIR = WEB_DIR / "results"
 UPLOAD_DIR.mkdir(exist_ok=True)
 RESULT_DIR.mkdir(exist_ok=True)
 
-# BI 内存缓存（淘汰 + 写入须在同一锁内，避免并发竞态）
-_BI_CACHE: dict = {}
+# BI 内存缓存（OrderedDict LRU，淘汰 O(1)）
+_BI_CACHE: OrderedDict = OrderedDict()
 _BI_CACHE_LOCK = threading.Lock()
 _BI_CACHE_MAX = 8
 
@@ -74,9 +82,10 @@ _BI_CACHE_MAX = 8
 def _bi_cache_put(token: str, entry: dict) -> None:
     """原子写入：容量淘汰与赋值在同一把锁内完成。"""
     with _BI_CACHE_LOCK:
-        if len(_BI_CACHE) >= _BI_CACHE_MAX and token not in _BI_CACHE:
-            oldest = min(_BI_CACHE, key=lambda k: _BI_CACHE[k]["ts"])
-            del _BI_CACHE[oldest]
+        if token in _BI_CACHE:
+            del _BI_CACHE[token]
+        elif len(_BI_CACHE) >= _BI_CACHE_MAX:
+            _BI_CACHE.popitem(last=False)
         _BI_CACHE[token] = entry
 
 
@@ -103,21 +112,25 @@ if str(_ROOT_PROJ) not in sys.path:
 from bom_date_key import calendar_date_key_yyyymmdd as _calendar_date_key_yyyymmdd
 
 from cost_sim_predict import (
+    baseline_prices_from_price_snap,
     build_product_category_index,
     build_product_cost_history,
     build_product_price_timeline,
     expand_product_cost_history_dict,
+    latest_bom_snapshot_from_rows,
     map_legacy_predict_en_to_zh,
     map_regression_analysis_en_to_zh,
     map_sensitivity_grid_en_to_zh,
     map_sensitivity_item_en_to_zh,
     normalize_predict_dataframes,
     normalize_price_list_cost_fields,
+    unit_hint_from_row,
     predict_product_price,
     _predict_product_price_legacy,
     _safe_float,
     quote_month_key_from_series,
 )
+from material_search import web_search_material_price
 
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -142,11 +155,12 @@ def err_413(e):
 
 @app.errorhandler(Exception)
 def err_any(e):
-    tb = traceback.format_exc().strip().split("\n")
-    return jsonify({
-        "error":  f"服务器内部错误：{e}",
-        "detail": tb[-1] if tb else None,
-    }), 500
+    app.logger.exception("未捕获异常")
+    resp: dict = {"error": "服务器内部错误，请稍后重试"}
+    if app.debug:
+        tb = traceback.format_exc().strip().split("\n")
+        resp["detail"] = tb[-1] if tb else None
+    return jsonify(resp), 500
 
 
 # ---------------------------------------------------------------------------
@@ -263,15 +277,8 @@ def _upload_price_path(session_id: str) -> Path | None:
 
 
 def _read_xlsx_as_polars(path: Path) -> pl.DataFrame:
-    """读取 Excel 第一张工作表（.xlsx / .xls）。
-    .xlsx 优先 polars+fastexcel；.xls 或失败时回退 pandas（需 xlrd）。
-    """
-    if path.suffix.lower() == ".xls":
-        return pl.from_pandas(pd.read_excel(path, sheet_name=0))
-    try:
-        return pl.read_excel(path)
-    except Exception:
-        return pl.from_pandas(pd.read_excel(path, sheet_name=0))
+    """读取 Excel 第一张工作表（.xlsx / .xls）；物料编码列强制 Utf8。"""
+    return read_excel_as_polars(path)
 
 
 def _norm_product_code_series(s: pd.Series) -> pd.Series:
@@ -296,7 +303,7 @@ def _attach_product_prices_pl(raw_pl: pl.DataFrame, price_path: Path) -> pl.Data
     drop_cols = ["产品价格", *_PRICE_EXTRA_COLS]
     bom = bom.drop(columns=[c for c in drop_cols if c in bom.columns], errors="ignore")
 
-    price = pd.read_excel(price_path, sheet_name=0)
+    price = read_price_excel(price_path)
     if COL_PRODUCT not in price.columns:
         if "ZMATNR" in price.columns:
             price = price.rename(columns={"ZMATNR": COL_PRODUCT})
@@ -413,10 +420,19 @@ def _attach_product_prices_pl(raw_pl: pl.DataFrame, price_path: Path) -> pl.Data
 
 
 def _product_price_snapshot_from_bom_rows(rows: list[dict]) -> dict:
-    """从 BOM 明细首行提取产品价格历史清单合并字段（供成本模拟页）；金额为 元/KG。"""
+    """从 BOM 明细提取产品价格历史清单合并字段（供成本模拟页）；金额为 元/KG。
+    优先选取报价月份最新的行；次选 CREATEDATE 最大的行；均无则取第一行。
+    """
     if not rows:
         return {}
-    r0 = rows[0]
+
+    def _row_sort_key(r: dict) -> tuple[str, str]:
+        return (
+            str(r.get("报价月份") or ""),
+            str(r.get(COL_CREATEDATE) or ""),
+        )
+
+    r0 = max(rows, key=_row_sort_key)
     out: dict = {"价格口径": "元/KG"}
     if "产品价格" in r0:
         out["总成本"] = _optional_rounded_float(r0.get("产品价格"))
@@ -487,8 +503,7 @@ def upload():
             return jsonify({"error": f"Excel 解析失败（第 1 个文件）：{exc}"}), 422
 
         df_pl   = normalize_columns(pl.from_pandas(df))
-        df_norm = df_pl.to_pandas()
-        missing = [c for c in REQUIRED_COLS if c not in df_norm.columns]
+        missing = [c for c in REQUIRED_COLS if c not in df_pl.columns]
         if missing:
             for p in saved_paths:
                 p.unlink(missing_ok=True)
@@ -496,7 +511,7 @@ def upload():
                 price_path.unlink(missing_ok=True)
             return jsonify({
                 "error":  f"缺少必要列：{missing}",
-                "detail": f"当前列名：{list(df.columns)}",
+                "detail": f"当前列名（规范化后）：{list(df_pl.columns)}",
                 "hint":   (
                     "必须包含（或其 SAP 导出别名）：\n"
                     "  产品编码（或 ZMATNR）、组件编码（或 IDNRK）、"
@@ -691,7 +706,7 @@ def _read_price_df(price_fp: "Path | None") -> "pd.DataFrame | None":
     if price_fp is None or not price_fp.exists():
         return None
     try:
-        df = pd.read_excel(price_fp, sheet_name=0)
+        df = read_price_excel(price_fp)
         # 规范化产品编码列名
         if COL_PRODUCT not in df.columns:
             for alias in ("ZMATNR", "MATNR", "所属产品"):
@@ -710,6 +725,30 @@ def _read_price_df(price_fp: "Path | None") -> "pd.DataFrame | None":
         return None
 
 
+# 预测算法实际使用的 BOM/价格列集合（存缓存时只保留这些列，大表可节省 50%+ 内存）
+_BOM_PREDICT_COLS = frozenset({
+    COL_PRODUCT, COL_COMPONENT, COL_QTY, COL_UNIT_PRICE, COL_CREATEDATE,
+    COL_MAKTX, COL_UNIT, COL_CATEGORY,
+    "报价月份", "产品价格", "材料成本", "工费", "重量", "标杆工厂",
+    "报价号", "ZBJNO", "报价流水号", "ZSNO",
+    "MEINS", "基本单位", "计量单位",
+})
+_PRICE_PREDICT_COLS = frozenset({
+    COL_PRODUCT, COL_CREATEDATE,
+    "ZMATNR", "MATNR", "所属产品",
+    "总成本", "产品价格", "DMBTR", "标价", "出厂价", "销售价",
+    "报价月份", "重量", "材料成本", "工费", "标杆工厂",
+})
+
+
+def _slim_df(df: "pd.DataFrame | None", keep_cols: frozenset) -> "pd.DataFrame | None":
+    """只保留预测所需列，裁减大表内存占用。"""
+    if df is None or df.empty:
+        return df
+    cols = [c for c in df.columns if c in keep_cols]
+    return df[cols] if cols else df
+
+
 def _fill_bi_cache(
     token: str,
     summary_pl: pl.DataFrame,
@@ -722,6 +761,9 @@ def _fill_bi_cache(
     product_categories: dict | None = None,
 ) -> None:
     """把分析管道已算好的 BI 表直接写入内存缓存，供 BI 接口秒返回。"""
+    # 裁剪到预测所需列，避免完整 BOM 大表长期驻留内存
+    bom_pd   = _slim_df(bom_pd,   _BOM_PREDICT_COLS)
+    price_pd = _slim_df(price_pd, _PRICE_PREDICT_COLS)
     summary_pd = summary_pl.to_pandas()
     summary_records = summary_pd.where(pd.notna(summary_pd), None).to_dict(orient="records")
 
@@ -738,6 +780,17 @@ def _fill_bi_cache(
     product_bom: dict[str, list] = {}
     for pid, grp in detail_pd.groupby(COL_PRODUCT, sort=False):
         product_bom[str(pid)] = grp.where(pd.notna(grp), None).to_dict(orient="records")
+
+    # 预计算并缓存排好序的产品 ID 列表（避免每次 bi_products 请求重新排序）
+    all_product_ids: list[str] = sorted(product_bom.keys(), key=lambda s: (len(s), s))
+
+    # 2 字符前缀分桶索引（加速大会话子串搜索：先缩小候选集，再做 `in` 判断）
+    product_prefix_index: dict[str, list[str]] = {}
+    for pid in all_product_ids:
+        prefix = pid[:2] if len(pid) >= 2 else pid
+        if prefix not in product_prefix_index:
+            product_prefix_index[prefix] = []
+        product_prefix_index[prefix].append(pid)
 
     # 价格历史明细（供日期区间价格波动查询）
     price_history_records: list = []
@@ -756,15 +809,17 @@ def _fill_bi_cache(
     )
 
     entry = {
-        "summary":              summary_records,
-        "detail":               detail_index,
-        "product_bom":          product_bom,
-        "price_history":        price_history_records,
-        "product_cost_history": pch,
-        "bom_pd":               bom_pd,
-        "price_pd":             price_pd,
-        "product_categories":   product_categories or {},
-        "ts":                   time.time(),
+        "summary":               summary_records,
+        "detail":                detail_index,
+        "product_bom":           product_bom,
+        "all_product_ids":       all_product_ids,
+        "product_prefix_index":  product_prefix_index,
+        "price_history":         price_history_records,
+        "product_cost_history":  pch,
+        "bom_pd":                bom_pd,
+        "price_pd":              price_pd,
+        "product_categories":    product_categories or {},
+        "ts":                    time.time(),
     }
     _bi_cache_put(token, entry)
 
@@ -1103,30 +1158,46 @@ def bi_products(session_id: str):
     if err:
         return err[0], err[1]
     assert cache is not None
-    pb = cache.get("product_bom") or {}
-    all_ids = sorted(pb.keys(), key=lambda s: (len(str(s)), str(s)))
+
+    # 优先使用缓存中预排序的列表（避免每次请求 O(n log n) 重新排序）
+    all_ids: list[str] = cache.get("all_product_ids") or sorted(
+        (cache.get("product_bom") or {}).keys(), key=lambda s: (len(s), s)
+    )
+    prefix_index: dict[str, list[str]] = cache.get("product_prefix_index") or {}
     total = len(all_ids)
     q = (request.args.get("q") or "").strip()
 
     min_q_len = 3 if total > 200_000 else 2
 
-    if total <= FULL_LIST_THRESHOLD:
+    def _search_ids(q: str, ids: list[str], idx: dict[str, list[str]], limit: int) -> list[str]:
+        """子串搜索：优先走前缀索引缩小候选集，再做 `in` 判断。"""
         if not q:
-            items = all_ids
-        else:
-            items = []
-            for p in all_ids:
-                if q in str(p):
-                    items.append(p)
-                    if len(items) >= limit:
+            return ids[:limit]
+        # 前缀索引：用查询串前 2 位缩小候选（对 SAP 物料号前缀相同的场景效果显著）
+        if len(q) >= 2 and idx:
+            candidates = idx.get(q[:2], [])
+            matched = [p for p in candidates if q in p]
+            # 候选集命中不足一半 limit 时，补全扫完整列表（兜底任意位置子串）
+            if len(matched) < limit:
+                seen = set(candidates)
+                for p in ids:
+                    if p not in seen and q in p:
+                        matched.append(p)
+                    if len(matched) >= limit:
                         break
+        else:
+            matched = [p for p in ids if q in p]
+        return matched[:limit]
+
+    if total <= FULL_LIST_THRESHOLD:
+        items = _search_ids(q, all_ids, prefix_index, limit) if q else all_ids
         return jsonify(
             {
                 "count":           total,
                 "total":           total,
                 "search_required": False,
                 "min_q_len":       min_q_len,
-                "products":        [{"id": str(p), "label": str(p)} for p in (items if q else all_ids)],
+                "products":        [{"id": p, "label": p} for p in (items if q else all_ids)],
             }
         )
 
@@ -1155,12 +1226,7 @@ def bi_products(session_id: str):
             }
         )
 
-    matched: list[str] = []
-    for p in all_ids:
-        if q in str(p):
-            matched.append(str(p))
-            if len(matched) >= limit:
-                break
+    matched = _search_ids(q, all_ids, prefix_index, limit)
 
     return jsonify(
         {
@@ -1176,41 +1242,6 @@ def bi_products(session_id: str):
     )
 
 
-def _baseline_prices_from_snap(
-    price_snap: dict,
-    weight_kg: float | None,
-) -> dict[str, Any]:
-    """从价格清单快照解析基准整件价(元/件)与基准价(元/kg)，避免把元/件误乘重量。"""
-    wt = _safe_float(weight_kg)
-    if wt is None:
-        wt = _safe_float(price_snap.get("重量"))
-    norm = normalize_price_list_cost_fields(
-        _safe_float(price_snap.get("材料成本")),
-        _safe_float(price_snap.get("工费")),
-        _safe_float(price_snap.get("总成本")),
-        wt,
-    )
-    piece = norm.get("total_piece")
-    per_kg = norm.get("total_per_kg")
-    raw_total = _safe_float(price_snap.get("总成本"))
-    if piece is None and raw_total is not None:
-        if norm.get("costs_are_per_piece"):
-            piece = raw_total
-            per_kg = raw_total / wt if wt and wt > 0 else None
-        elif wt and wt > 0:
-            per_kg = raw_total
-            piece = raw_total * wt
-        else:
-            piece = raw_total
-            per_kg = raw_total
-    list_unit = "元/件" if norm.get("costs_are_per_piece") else "元/KG"
-    return {
-        "基准产品价格": round(piece, 4) if piece is not None else None,
-        "基准产品价格_每公斤": round(per_kg, 4) if per_kg is not None else None,
-        "清单材料工费口径": list_unit,
-    }
-
-
 def _map_new_predict_result(
     pred: dict,
     price_snap: dict,
@@ -1219,7 +1250,7 @@ def _map_new_predict_result(
 ) -> dict:
     """将新 predict_product_price 的英文键结果映射为前端兼容的中文键格式。"""
     if "error" in pred:
-        bl = _baseline_prices_from_snap(price_snap, None)
+        bl = baseline_prices_from_price_snap(price_snap, None)
         return {
             "预测产品价格": None,
             "预测产品价格_每公斤": None,
@@ -1256,7 +1287,7 @@ def _map_new_predict_result(
     except (TypeError, ValueError):
         weight_f = None
 
-    bl = _baseline_prices_from_snap(price_snap, weight_f)
+    bl = baseline_prices_from_price_snap(price_snap, weight_f)
     base_product = bl.get("基准产品价格")
     base_total = bl.get("基准产品价格_每公斤")
 
@@ -1367,12 +1398,14 @@ def bi_product_bom(session_id: str):
     bom_pd = cache.get("bom_pd")
     price_pd = cache.get("price_pd")
     if bom_pd is not None and price_pd is not None:
+        bom_snap = latest_bom_snapshot_from_rows(product, rows)
         pred = predict_product_price(
             product,
             {},
             bom_pd,
             price_pd,
             reference_prices=prices_old,
+            latest_bom_snapshot=bom_snap,
         )
         pred = _map_new_predict_result(pred, price_snap, is_bom_load=True)
     else:
@@ -1462,12 +1495,19 @@ def _simulate_product_cost(
     price_pd = cache.get("price_pd")
     if bom_pd is not None and price_pd is not None:
         all_prices = {c: prices.get(c, prices_old[c]) for c in prices_old}
+        user_changes = {
+            c: all_prices[c]
+            for c in prices_old
+            if abs(all_prices[c] - prices_old[c]) > 1e-9
+        }
+        bom_snap = latest_bom_snapshot_from_rows(product, rows)
         pred = predict_product_price(
             product,
-            all_prices,
+            user_changes,
             bom_pd,
             price_pd,
             reference_prices=prices_old,
+            latest_bom_snapshot=bom_snap,
         )
         pred = _map_new_predict_result(pred, price_snap)
     else:
@@ -1712,294 +1752,6 @@ def _first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | Non
     return None
 
 
-def _strip_html(text: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _normalize_search_url(url: str) -> str:
-    """DuckDuckGo 结果常包一层跳转链接，这里还原真实地址。"""
-    url = html.unescape(url or "")
-    if "uddg=" in url:
-        parsed = urllib.parse.urlparse(url)
-        qs = urllib.parse.parse_qs(parsed.query)
-        if qs.get("uddg"):
-            return qs["uddg"][0]
-    if url.startswith("//"):
-        return "https:" + url
-    return url
-
-
-def _fetch_page_summary(url: str) -> dict:
-    """抓取搜索结果页的标题和 meta 描述，补强搜索摘要。"""
-    if not url or not url.startswith(("http://", "https://")):
-        return {"title": "", "description": ""}
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-                )
-            },
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            page = resp.read(180000).decode("utf-8", errors="ignore")
-    except Exception:
-        return {"title": "", "description": ""}
-
-    title = ""
-    m_title = re.search(r"<title[^>]*>(.*?)</title>", page, re.S | re.I)
-    if m_title:
-        title = _strip_html(m_title.group(1))
-
-    description = ""
-    m_desc = re.search(
-        r'<meta[^>]+(?:name|property)=["\'](?:description|og:description)["\'][^>]+content=["\']([^"\']+)["\']',
-        page,
-        re.S | re.I,
-    )
-    if not m_desc:
-        m_desc = re.search(
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:name|property)=["\'](?:description|og:description)["\']',
-            page,
-            re.S | re.I,
-        )
-    if m_desc:
-        description = _strip_html(m_desc.group(1))
-
-    return {"title": title[:160], "description": description[:260]}
-
-
-def _baidu_ai_search(query: str, *, max_results: int = 5) -> list[dict]:
-    """调用百度千帆 AI 搜索 API，返回网页标题、摘要、链接和日期。"""
-    api_key = os.environ.get("BAIDU_SEARCH_API_KEY", "").strip()
-    if not api_key:
-        return []
-
-    short_query = query.strip()
-    # 文档限制 content 72 字符以内；中文按更保守的长度截断。
-    if len(short_query) > 60:
-        short_query = short_query[:60]
-
-    payload = {
-        "messages": [{"role": "user", "content": short_query}],
-        "search_source": "baidu_search_v2",
-        "resource_type_filter": [{"type": "web", "top_k": max(1, min(max_results, 10))}],
-        "search_filter": {
-            "range": {
-                "page_time": {
-                    "gte": "now-3M/d",
-                    "lte": "now/d",
-                }
-            }
-        },
-        "sort": {"priority": "auto"},
-    }
-    headers = {
-        "Content-Type": "application/json",
-        # 文档示例使用 X-Appbuilder-Authorization，用户提供的 bce-v3 key 属于该类 API Key。
-        "X-Appbuilder-Authorization": f"Bearer {api_key}",
-    }
-    req = urllib.request.Request(
-        "https://qianfan.baidubce.com/v2/ai_search/web_search",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        return [{
-            "title": "百度千帆搜索失败",
-            "snippet": f"HTTP {exc.code}: {detail[:240]}",
-            "url": "",
-            "source": "baidu_qianfan",
-        }]
-    except Exception as exc:
-        return [{
-            "title": "百度千帆搜索失败",
-            "snippet": str(exc),
-            "url": "",
-            "source": "baidu_qianfan",
-        }]
-
-    if data.get("code") or data.get("message"):
-        return [{
-            "title": "百度千帆搜索失败",
-            "snippet": f"{data.get('code', '')} {data.get('message', '')}".strip(),
-            "url": "",
-            "source": "baidu_qianfan",
-        }]
-
-    results: list[dict] = []
-    for item in data.get("references", [])[:max_results]:
-        title = str(item.get("title") or item.get("web_anchor") or "").strip()
-        snippet = str(item.get("snippet") or item.get("content") or "").strip()
-        url = str(item.get("url") or "").strip()
-        date = str(item.get("date") or "").strip()
-        if title or snippet or url:
-            results.append({
-                "title": title,
-                "snippet": snippet,
-                "url": url,
-                "date": date,
-                "source": "baidu_qianfan",
-            })
-    return results
-
-
-def _web_search_material_price(material_name: str, *, max_results: int = 3) -> list[dict]:
-    """用公开搜索结果摘要收集物料近期价格/行情证据。"""
-    query = f"{material_name} 2026 价格 走势 行情 报价 原材料"
-    baidu_api_results = _baidu_ai_search(query, max_results=max_results)
-    if baidu_api_results and not all(item.get("title") == "百度千帆搜索失败" for item in baidu_api_results):
-        return baidu_api_results
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        )
-    }
-
-    url = "https://duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            page = resp.read().decode("utf-8", errors="ignore")
-    except Exception as exc:
-        page = ""
-
-    blocks = re.split(r'<div[^>]+class="[^"]*result[^"]*"[^>]*>', page)
-    results: list[dict] = []
-    for block in blocks:
-        title_match = re.search(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
-        if not title_match:
-            continue
-        snippet_match = re.search(r'class="result__snippet"[^>]*>(.*?)</(?:a|div)>', block, re.S)
-        title = _strip_html(title_match.group(2))
-        link = _normalize_search_url(title_match.group(1))
-        snippet = _strip_html(snippet_match.group(1)) if snippet_match else ""
-        page_summary = _fetch_page_summary(link) if len(results) < 2 else {"title": "", "description": ""}
-        if not snippet:
-            snippet = page_summary.get("description", "")
-        if page_summary.get("title") and page_summary["title"] not in title:
-            title = f"{title} | {page_summary['title']}"
-        if title:
-            results.append({"title": title, "snippet": snippet, "url": link})
-        if len(results) >= max_results:
-            break
-    if results:
-        return results[:max_results]
-
-    # 中文行业行情词优先回退到百度，通常比英文搜索引擎更容易命中中文报价/行情页。
-    baidu_url = "https://www.baidu.com/s?" + urllib.parse.urlencode({"wd": query})
-    try:
-        with urllib.request.urlopen(urllib.request.Request(baidu_url, headers=headers), timeout=15) as resp:
-            page = resp.read().decode("utf-8", errors="ignore")
-    except Exception:
-        page = ""
-
-    for block in re.findall(r'<div[^>]+(?:class="[^"]*result[^"]*"|tpl="[^"]+")[^>]*>(.*?)</div>\s*</div>', page, re.S | re.I):
-        title_match = re.search(r"<h3[^>]*>.*?<a[^>]+href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?</h3>", block, re.S | re.I)
-        if not title_match:
-            continue
-        snippet_match = re.search(r'<span[^>]+class="[^"]*(?:content-right|c-color-text)[^"]*"[^>]*>(.*?)</span>', block, re.S | re.I)
-        if not snippet_match:
-            snippet_match = re.search(r'<div[^>]+class="[^"]*(?:c-abstract|c-span-last)[^"]*"[^>]*>(.*?)</div>', block, re.S | re.I)
-        link = _normalize_search_url(title_match.group(1))
-        title = _strip_html(title_match.group(2))
-        snippet = _strip_html(snippet_match.group(1)) if snippet_match else ""
-        if title:
-            results.append({"title": title, "snippet": snippet, "url": link})
-        if len(results) >= max_results:
-            break
-    if results:
-        return results
-
-    # 百度也没结果时，再自动回退到 Bing。
-    bing_url = "https://www.bing.com/search?" + urllib.parse.urlencode({"q": query})
-    try:
-        with urllib.request.urlopen(urllib.request.Request(bing_url, headers=headers), timeout=15) as resp:
-            page = resp.read().decode("utf-8", errors="ignore")
-    except Exception as exc:
-        return [{"title": "搜索失败", "snippet": str(exc), "url": ""}]
-
-    for block in re.findall(r'<li[^>]+class="b_algo"[^>]*>(.*?)</li>', page, re.S | re.I):
-        title_match = re.search(r"<h2[^>]*>.*?<a[^>]+href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?</h2>", block, re.S | re.I)
-        if not title_match:
-            continue
-        snippet_match = re.search(r'<p[^>]*>(.*?)</p>', block, re.S | re.I)
-        link = _normalize_search_url(title_match.group(1))
-        title = _strip_html(title_match.group(2))
-        snippet = _strip_html(snippet_match.group(1)) if snippet_match else ""
-        page_summary = _fetch_page_summary(link) if len(results) < 2 else {"title": "", "description": ""}
-        if not snippet:
-            snippet = page_summary.get("description", "")
-        if page_summary.get("title") and page_summary["title"] not in title:
-            title = f"{title} | {page_summary['title']}"
-        if title:
-            results.append({"title": title, "snippet": snippet, "url": link})
-        if len(results) >= max_results:
-            break
-    if results:
-        return results
-
-    # 搜索引擎不可用时，给出行业行情入口作为方向性证据，避免最终报告完全失去依据。
-    lower = material_name.lower()
-    fallback = [
-        {
-            "title": f"{material_name} 1688 报价/批发价格入口",
-            "snippet": "用于观察同类物料现货报价区间、供应商报价密度和价格离散度，适合作为采购比价参考。",
-            "url": "https://www.1688.com/",
-        }
-    ]
-    if any(k in lower for k in ["ppr", "pp-r", "pp", "管件", "管材", "给水管"]):
-        fallback.extend([
-            {
-                "title": "PP / PPR 管材上游原料行情入口",
-                "snippet": "PPR 管件和管材主要受 PP 原料、丙烯、原油、装置检修、下游开工和房地产/基建需求影响。",
-                "url": "https://plas.oilchem.net/",
-            },
-            {
-                "title": "生意社 PP 商品指数与价格行情入口",
-                "snippet": "可用于跟踪 PP 原料价格趋势、上游成本支撑和短期市场情绪。",
-                "url": "https://www.100ppi.com/",
-            },
-        ])
-    if any(k in lower for k in ["pe", "聚乙烯", "包装", "膜", "opp"]):
-        fallback.extend([
-            {
-                "title": "PE / 包装膜上游原料行情入口",
-                "snippet": "PE、OPP、包装膜价格通常受原油、乙烯/丙烯、聚烯烃供应、薄膜需求和库存影响。",
-                "url": "https://plas.oilchem.net/",
-            },
-            {
-                "title": "生意社聚乙烯/聚丙烯行情入口",
-                "snippet": "可用于观察聚烯烃原料价格趋势和成本传导压力。",
-                "url": "https://www.100ppi.com/",
-            },
-        ])
-    if any(k in lower for k in ["钛白", "钛白粉"]):
-        fallback.append({
-            "title": "钛白粉行情与上游钛矿/硫酸成本入口",
-            "snippet": "钛白粉价格通常受钛矿、硫酸、出口订单、行业开工和库存变化影响。",
-            "url": "https://www.100ppi.com/",
-        })
-    if any(k in lower for k in ["碳酸钙", "钙粉"]):
-        fallback.append({
-            "title": "碳酸钙/填充母料行情与矿石能源成本入口",
-            "snippet": "碳酸钙价格通常受矿石、能源、运输、环保限产和下游塑料填充需求影响。",
-            "url": "https://www.100ppi.com/",
-        })
-    return fallback[:max_results]
-
-
 def _deepseek_model() -> str:
     return os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro").strip() or "deepseek-v4-pro"
 
@@ -2016,21 +1768,80 @@ def _deepseek_headers() -> dict:
     }
 
 
-def _deepseek_chat_completion(payload: dict, *, timeout: int = 60) -> dict:
-    req = urllib.request.Request(
-        "https://api.deepseek.com/chat/completions",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=_deepseek_headers(),
-        method="POST",
-    )
+def _requests_post_json(
+    url: str,
+    payload: dict,
+    headers: dict,
+    *,
+    timeout: tuple[float, float] | float,
+) -> dict:
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"DeepSeek API 调用失败（HTTP {exc.code}）：{detail[:300]}") from exc
-    except urllib.error.URLError as exc:
+        resp = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except requests.HTTPError as exc:
+        detail = (exc.response.text if exc.response is not None else str(exc))[:300]
+        code = exc.response.status_code if exc.response is not None else "?"
+        raise RuntimeError(f"API 调用失败（HTTP {code}）：{detail}") from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(f"无法连接 API：{exc}") from exc
+
+
+def _requests_stream_sse_deltas(
+    url: str,
+    payload: dict,
+    headers: dict,
+    *,
+    connect_timeout: float = 10.0,
+    read_timeout: float = 180.0,
+):
+    """解析 OpenAI 风格 SSE，逐块 yield delta content。"""
+    try:
+        with requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            stream=True,
+            timeout=(connect_timeout, read_timeout),
+        ) as resp:
+            resp.raise_for_status()
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                line = raw_line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    delta = chunk["choices"][0].get("delta", {}).get("content", "")
+                except Exception:
+                    delta = ""
+                if delta:
+                    yield delta
+    except requests.HTTPError as exc:
+        detail = (exc.response.text if exc.response is not None else str(exc))[:300]
+        code = exc.response.status_code if exc.response is not None else "?"
+        raise RuntimeError(f"DeepSeek API 调用失败（HTTP {code}）：{detail}") from exc
+    except requests.RequestException as exc:
         raise RuntimeError(f"无法连接 DeepSeek API：{exc}") from exc
+
+
+def _deepseek_chat_completion(payload: dict, *, timeout: int = 60) -> dict:
+    read_t = float(timeout) if timeout else 90.0
+    return _requests_post_json(
+        "https://api.deepseek.com/chat/completions",
+        payload,
+        _deepseek_headers(),
+        timeout=(10.0, read_t),
+    )
 
 
 _MARKET_SEARCH_TOOL = {
@@ -2057,7 +1868,7 @@ _MARKET_SEARCH_TOOL = {
 
 
 def _run_market_search_tool(query: str, material_name: str) -> dict:
-    results = _web_search_material_price(query, max_results=4)
+    results = web_search_material_price(query, max_results=4)
     evidence_strength = "较弱"
     if any(item.get("snippet") for item in results):
         evidence_strength = "中等"
@@ -2271,44 +2082,22 @@ def _deepseek_purchase_advice_payload(
 def _stream_deepseek_for_purchase_advice(materials: list[dict], start_date: str, end_date: str):
     messages, _ = _prepare_market_search_messages(materials, start_date, end_date)
 
-    req = urllib.request.Request(
-        "https://api.deepseek.com/chat/completions",
-        data=json.dumps(
-            _deepseek_purchase_advice_payload(
-                materials,
-                start_date,
-                end_date,
-                stream=True,
-                use_tools=False,
-                thinking_enabled=True,
-                messages=messages,
-            ),
-            ensure_ascii=False,
-        ).encode("utf-8"),
-        headers=_deepseek_headers(),
-        method="POST",
+    payload = _deepseek_purchase_advice_payload(
+        materials,
+        start_date,
+        end_date,
+        stream=True,
+        use_tools=False,
+        thinking_enabled=True,
+        messages=messages,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="ignore").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                    delta = chunk["choices"][0].get("delta", {}).get("content", "")
-                except Exception:
-                    delta = ""
-                if delta:
-                    yield delta
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"DeepSeek API 调用失败（HTTP {exc.code}）：{detail[:300]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"无法连接 DeepSeek API：{exc}") from exc
+    yield from _requests_stream_sse_deltas(
+        "https://api.deepseek.com/chat/completions",
+        payload,
+        _deepseek_headers(),
+        connect_timeout=10.0,
+        read_timeout=180.0,
+    )
 
 
 @app.route("/api/bi/ai_purchase_advice/<session_id>")
@@ -2349,8 +2138,12 @@ def bi_ai_purchase_advice_stream(session_id: str):
         return jsonify({"error": "无效的令牌"}), 400
 
     file_path = RESULT_DIR / f"{session_id}.xlsx"
-    if not file_path.exists():
-        return jsonify({"error": "文件不存在或已过期，请重新分析"}), 404
+    # 优先检查内存缓存（分析完成即可用，无需等待背景 Excel 写盘）；
+    # 缓存不存在时才退化到要求文件落盘。
+    with _BI_CACHE_LOCK:
+        in_cache = session_id in _BI_CACHE
+    if not in_cache and not file_path.exists():
+        return jsonify({"error": "分析结果不存在或已过期，请重新分析"}), 404
 
     def sse(event: str, data) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -2448,7 +2241,7 @@ def _should_auto_open_browser(*, debug: bool, use_reloader: bool) -> bool:
 
 
 if __name__ == "__main__":
-    _DEBUG = True
+    _DEBUG = os.environ.get("FLASK_DEBUG", "").strip().lower() in ("1", "true")
     _USE_RELOADER = _DEBUG
 
     print()
@@ -2463,4 +2256,5 @@ if __name__ == "__main__":
             kwargs={"url": "http://127.0.0.1:5000/", "delay_sec": 1.0},
             daemon=True,
         ).start()
-    app.run(debug=_DEBUG, use_reloader=_USE_RELOADER, port=5000, host="0.0.0.0")
+    _HOST = os.environ.get("BOM_WEB_HOST", "127.0.0.1")
+    app.run(debug=_DEBUG, use_reloader=_USE_RELOADER, port=5000, host=_HOST)

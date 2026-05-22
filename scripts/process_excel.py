@@ -35,6 +35,20 @@ COL_MAKTX      = "MAKTX"
 
 REQUIRED_COLS = [COL_PRODUCT, COL_COMPONENT, COL_QTY, COL_UNIT_PRICE]
 
+MATERIAL_CODE_COLUMN_NAMES = frozenset({
+    COL_PRODUCT,
+    COL_COMPONENT,
+    "ZMATNR",
+    "IDNRK",
+    "MATNR",
+    "所属产品",
+    "材料编码",
+})
+
+
+def _pandas_material_code_dtypes(columns: list[str]) -> dict[str, type]:
+    return {c: str for c in columns if c in MATERIAL_CODE_COLUMN_NAMES}
+
 # SAP / 内控清单列名 → 脚本标准列名
 _COL_ALIASES: dict[str, str] = {
     "ZMATNR": COL_PRODUCT,
@@ -121,8 +135,10 @@ def _print_no_excel_error() -> None:
 
 def _read_one_excel(path: Path) -> pl.DataFrame:
     print(f"  读取：{path.name}")
+    cols = list(pd.read_excel(path, sheet_name=0, nrows=0).columns)
+    dtype = _pandas_material_code_dtypes(cols)
     return (
-        pl.from_pandas(pd.read_excel(path, sheet_name=0))
+        pl.from_pandas(pd.read_excel(path, sheet_name=0, dtype=dtype or None))
         .with_columns(pl.lit(path.name).alias("_源文件"))
     )
 
