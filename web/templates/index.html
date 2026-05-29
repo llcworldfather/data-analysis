@@ -5,12 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BOM 成本分析工具</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <script>window.tailwind||document.write('<script src="/static/vendor/tailwindcdn.js"><\\/script>')</script>
+  <link rel="stylesheet" href="/static/css/site.css" />
   <style>
     :root { --blue: #2563EB; --blue-light: #EFF6FF; --green: #16A34A; }
     * { box-sizing: border-box; }
-    body { font-family: 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+    body { font-family: 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif; }
 
     /* ── Dropzone ── */
     .dropzone { transition: border-color .2s, background .2s; }
@@ -100,7 +100,8 @@
   </h1>
   <p class="text-base sm:text-lg text-slate-500 max-w-lg mx-auto leading-relaxed">
     上传标准 Excel，自动生成产品成本排名、组件占比、<br class="hidden sm:block">
-    跨产品波动等 <strong class="text-slate-700">6 张专业报表</strong>。
+    跨产品波动等 <strong class="text-slate-700">6 张专业报表</strong>。<br class="hidden sm:block">
+    <span class="text-slate-400 text-sm">本地分析结果默认保留 7 天，过期自动清理。</span>
   </p>
 </div>
 
@@ -475,7 +476,7 @@
 
 <!-- Footer -->
 <footer class="text-center py-6 text-xs text-slate-400 border-t border-slate-200 bg-white">
-  BOM 成本分析工具 · 本地运行 · 数据不出本机
+  BOM 成本分析工具 · 本地运行 · 数据不出本机 · 结果保留 7 天
 </footer>
 
 <!-- ═══════════════════ MULTI-FILE MODAL ═══════════════════ -->
@@ -872,7 +873,7 @@ async function startProcess() {
   }
 
   setView('success');
-  toast('分析完成！报告已就绪，请下载。', 'success');
+  toast('分析完成！可立即进入 BI 看板；Excel 导出可在后台稍后下载。', 'success');
 }
 
 /* ── 视图状态机 ── */

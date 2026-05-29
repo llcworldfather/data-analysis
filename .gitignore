@@ -6,21 +6,17 @@ __pycache__/
 venv/
 .env
 .env.*
+.pytest_cache/
 
-# 本地数据与生成结果（勿提交业务 Excel）
-data/*.xlsx
-data/*.XLSX
-data/*.xls
-output/*.xlsx
-output/*.XLSX
+# Web 上传与生成结果（勿提交业务 Excel）
 web/uploads/*
 !web/uploads/.gitkeep
 web/results/*
 !web/results/.gitkeep
-web/output/*
-!web/output/.gitkeep
 
-# 编辑器 / OS
+# 编辑器 / IDE / 本地工具缓存
+.idea/
+.antigravitycli/
 .DS_Store
 Thumbs.db
 *.swp

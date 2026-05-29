@@ -1,30 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-BOM 成本分析（Polars）— 网页版随包副本
+BOM 成本分析（Polars）— Web 分析内核
 --------------------------------------
-本文件与 `web/app.py` 同目录，供 Flask 直接 import，不依赖项目其他目录。
-
-可选命令行（在 web 目录下）：
-  python process_excel.py          # 读取本目录下 data/ 内全部 xlsx → output/
-  python process_excel.py --per-file
-
-依赖见同目录 requirements.txt
+供 `web/app.py` import：列规范化、聚合、各工作表计算与 Excel 写出辅助。
 """
 from __future__ import annotations
 
-import argparse
 import re
-import sys
 from typing import Any
-from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import polars as pl
-
-ROOT       = Path(__file__).resolve().parent
-DATA_DIR   = ROOT / "data"
-OUTPUT_DIR = ROOT / "output"
 
 COL_PRODUCT    = "产品编码"
 COL_COMPONENT  = "组件编码"
@@ -154,98 +141,6 @@ def read_price_excel(path: Path) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# I/O
-# ---------------------------------------------------------------------------
-
-def _excel_paths_in_data() -> list[Path]:
-    """收集 data/ 下所有 Excel 工作簿（扩展名不区分大小写：.xlsx / .XLSX）。"""
-    if not DATA_DIR.is_dir():
-        return []
-    seen: set[str] = set()
-    paths: list[Path] = []
-    for p in DATA_DIR.iterdir():
-        if not p.is_file():
-            continue
-        if p.suffix.lower() != ".xlsx":
-            continue
-        key = p.name.lower()
-        if key not in seen:
-            seen.add(key)
-            paths.append(p)
-    return sorted(paths, key=lambda x: x.name.lower())
-
-
-def _print_no_excel_error() -> None:
-    listing = ""
-    if DATA_DIR.is_dir():
-        names = sorted(p.name for p in DATA_DIR.iterdir())
-        listing = f"\n当前 data 目录内文件：{names if names else '（空）'}"
-    else:
-        listing = f"\n（不存在 data 目录，期望路径：{DATA_DIR.resolve()}）"
-    print(
-        f"错误：在 {DATA_DIR.resolve()} 中未找到 Excel（扩展名须为 .xlsx，大小写不限）。"
-        f"{listing}\n"
-        f"请将 .xlsx 放在本目录下的 data 文件夹中。"
-    )
-
-
-def _read_one_excel_lazy(path: Path) -> pl.LazyFrame:
-    print(f"  读取：{path.name}")
-    return (
-        read_excel_as_polars(path)
-        .lazy()
-        .with_columns(pl.lit(path.name).alias("_源文件"))
-    )
-
-
-def _read_one_excel(path: Path) -> pl.DataFrame:
-    return _read_one_excel_lazy(path).collect()
-
-
-def _validate_required_columns(raw: pl.DataFrame) -> None:
-    missing = [c for c in REQUIRED_COLS if c not in raw.columns]
-    if missing:
-        print(f"错误：缺少必要列 {missing}\n当前列名：{raw.columns}")
-        sys.exit(1)
-
-
-def load_all_excels_lazy() -> pl.LazyFrame:
-    paths = _excel_paths_in_data()
-    if not paths:
-        _print_no_excel_error()
-        sys.exit(1)
-    lfs = [_read_one_excel_lazy(p) for p in paths]
-    return pl.concat(lfs, how="diagonal")
-
-
-def load_all_excels() -> pl.DataFrame:
-    raw = load_all_excels_lazy().collect()
-    _validate_required_columns(raw)
-    return raw
-
-
-def _safe_report_stem(stem: str, max_len: int = 60) -> str:
-    """用于输出文件名：去掉 Windows 非法字符，避免空串。"""
-    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem)
-    s = s.strip(" .") or "report"
-    return s[:max_len]
-
-
-def _unique_output_paths_for_per_file(paths: list[Path], ts: str) -> list[tuple[Path, Path]]:
-    """返回 (源路径, 输出 xlsx 路径) 列表；同名净化 stem 时自动加后缀区分。"""
-    stem_count: dict[str, int] = {}
-    result: list[tuple[Path, Path]] = []
-    for p in paths:
-        base = _safe_report_stem(p.stem)
-        n = stem_count.get(base, 0) + 1
-        stem_count[base] = n
-        suffix = "" if n == 1 else f"_{n}"
-        out_name = f"bom_analysis_{base}{suffix}_{ts}.xlsx"
-        result.append((p, OUTPUT_DIR / out_name))
-    return result
-
-
-# ---------------------------------------------------------------------------
 # 清洗与聚合
 # ---------------------------------------------------------------------------
 
@@ -264,7 +159,46 @@ def prepare(raw: pl.DataFrame) -> pl.DataFrame:
 
 
 def aggregate_lines(d: pl.DataFrame) -> pl.DataFrame:
-    """按 产品编码+组件编码 分组，汇总用量、取加权均价、取计量单位与组件名称。"""
+    """按 产品编码+组件编码 分组，汇总用量、取加权均价、取计量单位与组件名称。
+
+    修复（问题1）：若含 CREATEDATE，先将每个产品过滤到最新有效日期，避免历史多
+    期 BOM 价格混合加权均值导致当前成本基准失真。无有效日期的产品全量保留（容错）。
+    """
+    # ── 过滤到每个产品的最新有效 BOM 日期 ─────────────────────────────────
+    if COL_CREATEDATE in d.columns:
+        dk_expr = (
+            pl.col(COL_CREATEDATE)
+            .cast(pl.String)
+            .str.strip_chars()
+            .str.replace(r"\.0$", "")
+            .str.replace_all(r"[^\d]", "")
+            .str.slice(0, 8)
+        )
+        d = d.with_columns(dk_expr.alias("_agg_dk"))
+        # 每产品取最新有效 8 位日期（排除 00000000 / 早于 1900 年 / 过短）
+        valid_dates = (
+            d.filter(
+                (pl.col("_agg_dk").str.len_chars() == 8)
+                & (pl.col("_agg_dk") > "19000101")
+                & (pl.col("_agg_dk") != "00000000")
+            )
+            .group_by(COL_PRODUCT)
+            .agg(pl.col("_agg_dk").max().alias("_latest_dk"))
+        )
+        if valid_dates.height > 0:
+            # 仅保留该产品最新日期行；无有效日期的产品（_latest_dk 为 null）全量保留
+            d = (
+                d.join(valid_dates, on=COL_PRODUCT, how="left")
+                .filter(
+                    pl.col("_latest_dk").is_null()
+                    | (pl.col("_agg_dk") == pl.col("_latest_dk"))
+                )
+                .drop(["_agg_dk", "_latest_dk"])
+            )
+        else:
+            d = d.drop("_agg_dk")
+
+    # ── 分组聚合 ──────────────────────────────────────────────────────────
     gcols = [COL_PRODUCT, COL_COMPONENT]
     agg_exprs: list[pl.Expr] = [
         pl.col(COL_QTY).sum().alias("MENGE合计"),
@@ -490,82 +424,3 @@ def _write_sheet(writer: pd.ExcelWriter, df: pl.DataFrame, name: str) -> None:
         if col in (COL_PRODUCT, COL_COMPONENT, "核心成本组件编码"):
             pdf[col] = pdf[col].astype(str)
     pdf.to_excel(writer, sheet_name=name, index=False)
-
-
-def run_pipeline(raw: pl.DataFrame, out_xlsx: Path, *, label: str = "") -> None:
-    """假定 raw 已加载；日志从 [2/6] 起，与主流程中 [1/6] 加载衔接。"""
-    prefix = f"{label} " if label else ""
-    print(f"{prefix}      原始数据：{raw.height:,} 行 × {raw.width} 列")
-
-    print(f"{prefix}[2/6] 清洗与聚合...")
-    lines = enrich(aggregate_lines(prepare(raw)))
-    print(f"      聚合后：{lines.height:,} 个产品-组件组合")
-
-    print(f"{prefix}[3/6] 产品总成本排名...")
-    tbl_summary = sheet_product_summary(lines)
-
-    print(f"{prefix}[4/6] 组件全局成本排名...")
-    tbl_comp_rank = sheet_component_global_rank(lines)
-
-    print(f"{prefix}[5/6] 跨产品用量波动...")
-    tbl_volatility = sheet_cross_product_volatility(lines)
-
-    print(f"{prefix}[6/6] 各产品 Top3 成本组件...")
-    tbl_top3 = top3_per_product(lines)
-
-    print(f"{prefix}写入 Excel：{out_xlsx.name} …")
-    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
-        _write_sheet(writer, tbl_summary,             "产品总成本排名")
-        _write_sheet(writer, sheet_bom_detail(lines), "BOM明细_占比与成本")
-        _write_sheet(writer, tbl_comp_rank,           "组件全局成本排名")
-        _write_sheet(writer, tbl_volatility,          "跨产品用量波动")
-        _write_sheet(writer, tbl_top3,                "各产品Top3成本组件")
-
-    print(f"{prefix}  已写出：{out_xlsx}")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="读取 web/data/ 下 Excel，生成 BOM 成本分析报表到 web/output/。"
-    )
-    parser.add_argument(
-        "--per-file",
-        action="store_true",
-        help="每个 Excel 单独生成一份 bom_analysis_<文件名>_<时间戳>.xlsx（默认：全部合并为一份）",
-    )
-    args = parser.parse_args()
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    if args.per_file:
-        paths = _excel_paths_in_data()
-        if not paths:
-            _print_no_excel_error()
-            sys.exit(1)
-        pairs = _unique_output_paths_for_per_file(paths, ts)
-        print(f"模式：每文件一份报告（共 {len(pairs)} 个 Excel）\n")
-        for i, (src, out_xlsx) in enumerate(pairs, start=1):
-            tag = f"[{i}/{len(pairs)} {src.name}]"
-            print(f"{tag} [1/6] 加载数据...")
-            raw = _read_one_excel_lazy(src).collect()
-            _validate_required_columns(raw)
-            run_pipeline(raw, out_xlsx, label=tag)
-        print(f"\n完成！共生成 {len(pairs)} 个 Excel 报告（时间戳 {ts}）。")
-        print("  工作表：产品总成本排名 | BOM明细_占比与成本 | 组件全局成本排名 | 跨产品用量波动 | 各产品Top3成本组件")
-        return
-
-    print("模式：合并 data/ 下全部 Excel 为一份报告\n")
-    print("[1/6] 加载数据...")
-    raw = load_all_excels_lazy().collect()
-    _validate_required_columns(raw)
-    out_xlsx = OUTPUT_DIR / f"bom_analysis_{ts}.xlsx"
-    run_pipeline(raw, out_xlsx)
-    print(f"\n完成！")
-    print(f"  Excel 报告：{out_xlsx}")
-    print(f"  工作表：产品总成本排名 | BOM明细_占比与成本 | 组件全局成本排名 | 跨产品用量波动 | 各产品Top3成本组件")
-
-
-if __name__ == "__main__":
-    main()

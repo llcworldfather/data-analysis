@@ -436,26 +436,36 @@ def _infer_costs_are_per_piece(
     wt: float | None,
     unit_hint: UnitHint,
 ) -> bool:
-    """在材料+工费可用时，判定清单口径为元/件还是元/KG。"""
+    """在材料+工费可用时，判定清单口径为元/件还是元/KG。
+
+    修复（问题5）：保守策略——仅在有可靠交叉验证时才判定为元/件，避免阈值
+    启发式在非典型产品（极轻件/重型件）上将口径判反，产生整个重量倍数的价格偏差。
+    无法可靠判断时，优先信任清单文档声明的元/KG口径（返回 False）。
+    """
+    # 强信号：价格清单数值结构本身隐含整件报价
     if _price_list_values_imply_per_piece(sum_ml, total_f, wt):
         return True
+    # BOM 计量单位给出明确信号
     if unit_hint == "piece":
         return True
     if unit_hint == "kg":
         return False
 
-    threshold = _per_piece_total_threshold_yuan()
+    # unit_hint == "unknown"：仅在有重量 + 总成本三字段交叉验证时才推断
     has_wt = wt is not None and wt > 1e-12
-    if has_wt:
-        if total_f is not None and total_f > 1e-12:
-            rel_sum_total = abs(sum_ml - total_f) / max(sum_ml, 1e-9)
-            if rel_sum_total < 0.06:
-                return sum_ml > threshold
-            if abs(sum_ml / wt - total_f) / max(total_f, 1e-9) < 0.08:
-                return True
-            return False
-        return sum_ml > threshold
-    return sum_ml > threshold
+    if has_wt and total_f is not None and total_f > 1e-12:
+        rel_sum_total = abs(sum_ml - total_f) / max(sum_ml, 1e-9)
+        if rel_sum_total < 0.06:
+            # mat+labor ≈ total：内部一致，用阈值判断口径
+            return sum_ml > _per_piece_total_threshold_yuan()
+        if abs(sum_ml / wt - total_f) / max(total_f, 1e-9) < 0.08:
+            # mat+labor / 重量 ≈ total(元/kg)：说明 mat/labor 已是元/件
+            return True
+        # 三字段相互矛盾，无法可靠判断，保守默认元/KG
+        return False
+
+    # 无有效重量或无总成本：缺乏交叉验证，保守默认元/KG（文档声明口径）
+    return False
 
 
 def normalize_price_list_cost_fields(
@@ -836,8 +846,14 @@ def build_product_cost_history(raw_pl: pl.DataFrame) -> dict[str, list[dict[str,
         pl.col("_line").sum().alias("_line")
     )
     # 同日多报价版本：取排序后最后一条（最新报价），避免对版本做均值稀释
+    # 修复（问题6）：报价号优先按数字升序排序，避免字符串排序下 "9" > "10"
+    # 导致取错最新版本（如 "9" 排在 "10"、"11" 之后）。
     bom_by_day = (
-        version_daily.sort([COL_PRODUCT, "_dk", "_qv"], nulls_last=True)
+        version_daily
+        .with_columns(
+            pl.col("_qv").cast(pl.Int64, strict=False).alias("_qv_num")
+        )
+        .sort([COL_PRODUCT, "_dk", "_qv_num", "_qv"], nulls_last=True)
         .group_by([COL_PRODUCT, "_dk"])
         .agg(pl.col("_line").last().alias("bom_material"))
     )
@@ -1129,7 +1145,7 @@ def expand_product_cost_history_dict(
 
 
 def _regression_fit_grade(r2: float, n: int) -> str:
-    """回归拟合效果文字等级（供页面展示）。"""
+    """回归拟合效果文字等级（基于调整R²，已内置小样本过拟合惩罚）。"""
     if n < 3:
         return "未启用"
     if r2 < 0:
@@ -1169,8 +1185,14 @@ def _linear_fit_predict(
     y_hat = X @ beta
     ss_res = float(np.sum((y - y_hat) ** 2))
     ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
-    r2 = min(1.0, float(r2))
+    # 修复（问题7）：调整R²（p=1，截距+斜率），对小样本过拟合进行惩罚。
+    # adj_R² = 1 - (SS_res/(n-2)) / (SS_tot/(n-1))；n=3时惩罚最重，
+    # 防止 3 点完美过拟合被标记为「优」。允许负值（模型劣于均值预测时）。
+    if ss_tot > 1e-12 and n > 2:
+        r2 = float(1.0 - (ss_res / (n - 2)) / (ss_tot / (n - 1)))
+        r2 = min(1.0, max(-1.0, r2))
+    else:
+        r2 = 0.0
     return pred, r2, n, intercept, slope
 
 
@@ -1253,16 +1275,37 @@ def _filter_slopes_mad(
     return new_slopes, None
 
 
+# 修复（问题8）：单产品 Theil-Sen 最大点数；超过时保留最新一半 + 随机旧点，
+# 将 O(n²) 斜率对数控制在 ~900 以内，防止大数据集下首次预测超时。
+_THEIL_SEN_MAX_POINTS = 60
+
+
 def _robust_slopes_from_points(
     points: list[tuple[str, float, float]],
 ) -> tuple[list[float], list[float] | None]:
     """
     Theil-Sen 风格斜率样本：用所有成对变化估计产品价对 BOM 材料变化的传导。
     返回 (slopes, weights)；若时间键可解析则对较新样本对加权（指数衰减）。
+
+    修复（问题8）：历史点数超过 _THEIL_SEN_MAX_POINTS 时，保留最新一半
+    + 随机采样旧点，将斜率对数的 O(n²) 计算量控制在可接受范围内。
     """
     n = len(points)
     if n < 2:
         return [], None
+    # 超过阈值时子采样，避免大历史数据集下 O(n²) 斜率对数爆炸
+    if n > _THEIL_SEN_MAX_POINTS:
+        recent_n = _THEIL_SEN_MAX_POINTS // 2
+        old_n = _THEIL_SEN_MAX_POINTS - recent_n
+        recent = points[-recent_n:]
+        old_pool = points[:-recent_n]
+        if len(old_pool) > old_n:
+            sample_idx = sorted(random.sample(range(len(old_pool)), old_n))
+            old_sampled = [old_pool[i] for i in sample_idx]
+        else:
+            old_sampled = old_pool
+        points = old_sampled + recent
+        n = len(points)
     xs = np.array([p[1] for p in points], dtype=float)
     dx_floor = max(1e-9, float(np.nanmedian(np.abs(xs))) * 1e-5)
     month_idxs = [_month_index_from_key(p[0]) for p in points]

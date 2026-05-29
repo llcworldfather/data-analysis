@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import io
 import json
-from collections import OrderedDict
 import math
 import os
 import re
@@ -37,6 +36,10 @@ import sys
 from flask import Flask, request, jsonify, send_file, render_template, Response, stream_with_context
 import pandas as pd
 import polars as pl
+
+from services import bi_cache
+from routes.bi import bp as bi_bp, init_blueprint as init_bi_blueprint
+from routes.bi_common import optional_rounded_float
 
 from process_excel import (
     prepare,
@@ -64,7 +67,7 @@ from process_excel import (
     _write_sheet,
 )
 
-app = Flask(__name__, template_folder="templates")
+app = Flask(__name__, template_folder="templates", static_folder="static", static_url_path="/static")
 app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
 
 WEB_DIR    = Path(__file__).parent
@@ -72,21 +75,59 @@ UPLOAD_DIR = WEB_DIR / "uploads"
 RESULT_DIR = WEB_DIR / "results"
 UPLOAD_DIR.mkdir(exist_ok=True)
 RESULT_DIR.mkdir(exist_ok=True)
-
-# BI 内存缓存（OrderedDict LRU，淘汰 O(1)）
-_BI_CACHE: OrderedDict = OrderedDict()
-_BI_CACHE_LOCK = threading.Lock()
-_BI_CACHE_MAX = 8
+bi_cache.init(RESULT_DIR)
 
 
-def _bi_cache_put(token: str, entry: dict) -> None:
-    """原子写入：容量淘汰与赋值在同一把锁内完成。"""
-    with _BI_CACHE_LOCK:
-        if token in _BI_CACHE:
-            del _BI_CACHE[token]
-        elif len(_BI_CACHE) >= _BI_CACHE_MAX:
-            _BI_CACHE.popitem(last=False)
-        _BI_CACHE[token] = entry
+def _retention_days() -> int:
+    try:
+        return max(1, int(os.environ.get("BOM_RETENTION_DAYS", "7")))
+    except ValueError:
+        return 7
+
+
+def purge_stale_files(directory: Path, *, max_age_days: int | None = None) -> int:
+    """删除 directory 下 mtime 早于保留期的普通文件。"""
+    if not directory.is_dir():
+        return 0
+    days = _retention_days() if max_age_days is None else max(1, max_age_days)
+    cutoff = time.time() - days * 86400
+    removed = 0
+    for p in directory.iterdir():
+        if p.is_file() and p.stat().st_mtime < cutoff:
+            p.unlink(missing_ok=True)
+            removed += 1
+    return removed
+
+
+def _purge_upload_and_results() -> None:
+    u = purge_stale_files(UPLOAD_DIR)
+    r = purge_stale_files(RESULT_DIR)
+    if u or r:
+        app.logger.info(
+            "已清理过期文件 uploads=%s results=%s（保留 %s 天）",
+            u,
+            r,
+            _retention_days(),
+        )
+
+
+def _schedule_daily_purge() -> None:
+    def _tick() -> None:
+        _purge_upload_and_results()
+        threading.Timer(86400.0, _tick).start()
+
+    threading.Timer(86400.0, _tick).start()
+
+
+def _wait_result_excel(session_id: str, file_path: Path, timeout: float = 120.0) -> bool:
+    """等待后台 Excel 写完；已存在则立即返回 True。"""
+    if file_path.exists():
+        return True
+    with _EXCEL_EVENTS_LOCK:
+        ev = _EXCEL_EVENTS.get(session_id)
+    if ev is not None:
+        ev.wait(timeout=timeout)
+    return file_path.exists()
 
 
 def _load_env_file(path: Path) -> None:
@@ -116,7 +157,6 @@ from cost_sim_predict import (
     build_product_category_index,
     build_product_cost_history,
     build_product_price_timeline,
-    expand_product_cost_history_dict,
     latest_bom_snapshot_from_rows,
     map_legacy_predict_en_to_zh,
     map_regression_analysis_en_to_zh,
@@ -399,12 +439,17 @@ def _attach_product_prices_pl(raw_pl: pl.DataFrame, price_path: Path) -> pl.Data
 
     merged = bom.copy()
     merge_chain: list[list[str]] = []
+    # 修复（问题15）：对齐优先级改为「精确日期(YYYYMMDD) → 报价月份(YYYYMM) → 仅产品」。
+    # 原逻辑月度(_qm)先于日期(_dk)，导致粗粒度月度匹配先填充后，
+    # 精确日期匹配被 coalesce 跳过，丢失更精细的对齐机会。
+    if "_dk" in merged.columns and "_dk" in price.columns:
+        if "重量" in merged.columns and "重量" in price.columns:
+            merge_chain.append([COL_PRODUCT, "_dk", "重量"])
+        merge_chain.append([COL_PRODUCT, "_dk"])
     if "_qm" in merged.columns and "_qm" in price.columns:
         if "重量" in merged.columns and "重量" in price.columns:
             merge_chain.append([COL_PRODUCT, "_qm", "重量"])
         merge_chain.append([COL_PRODUCT, "_qm"])
-    if "_dk" in merged.columns and "_dk" in price.columns:
-        merge_chain.append([COL_PRODUCT, "_dk"])
     merge_chain.append([COL_PRODUCT])
 
     seen: set[tuple[str, ...]] = set()
@@ -435,10 +480,10 @@ def _product_price_snapshot_from_bom_rows(rows: list[dict]) -> dict:
     r0 = max(rows, key=_row_sort_key)
     out: dict = {"价格口径": "元/KG"}
     if "产品价格" in r0:
-        out["总成本"] = _optional_rounded_float(r0.get("产品价格"))
+        out["总成本"] = optional_rounded_float(r0.get("产品价格"))
     for c in _PRICE_EXTRA_COLS:
         if c in r0:
-            out[c] = _optional_rounded_float(r0.get(c))
+            out[c] = optional_rounded_float(r0.get(c))
     return out
 
 
@@ -688,15 +733,15 @@ def _run_pipeline(raw_df: pl.DataFrame, out_path: Path):
     ]
 
     token = out_path.stem   # 文件名即 UUID token
-    ev    = threading.Event()
-    with _EXCEL_EVENTS_LOCK:
-        _EXCEL_EVENTS[token] = ev
-
-    threading.Thread(
-        target=_bg_write_excel,
-        args=(out_path, token, sheets),
-        daemon=True,
-    ).start()
+    if bi_cache.write_excel_enabled():
+        ev = threading.Event()
+        with _EXCEL_EVENTS_LOCK:
+            _EXCEL_EVENTS[token] = ev
+        threading.Thread(
+            target=_bg_write_excel,
+            args=(out_path, token, sheets),
+            daemon=True,
+        ).start()
 
     return lines, summary_pl, detail_pl, price_history_pl, product_cost_history, bom_pd
 
@@ -723,105 +768,6 @@ def _read_price_df(price_fp: "Path | None") -> "pd.DataFrame | None":
         return df_norm
     except Exception:
         return None
-
-
-# 预测算法实际使用的 BOM/价格列集合（存缓存时只保留这些列，大表可节省 50%+ 内存）
-_BOM_PREDICT_COLS = frozenset({
-    COL_PRODUCT, COL_COMPONENT, COL_QTY, COL_UNIT_PRICE, COL_CREATEDATE,
-    COL_MAKTX, COL_UNIT, COL_CATEGORY,
-    "报价月份", "产品价格", "材料成本", "工费", "重量", "标杆工厂",
-    "报价号", "ZBJNO", "报价流水号", "ZSNO",
-    "MEINS", "基本单位", "计量单位",
-})
-_PRICE_PREDICT_COLS = frozenset({
-    COL_PRODUCT, COL_CREATEDATE,
-    "ZMATNR", "MATNR", "所属产品",
-    "总成本", "产品价格", "DMBTR", "标价", "出厂价", "销售价",
-    "报价月份", "重量", "材料成本", "工费", "标杆工厂",
-})
-
-
-def _slim_df(df: "pd.DataFrame | None", keep_cols: frozenset) -> "pd.DataFrame | None":
-    """只保留预测所需列，裁减大表内存占用。"""
-    if df is None or df.empty:
-        return df
-    cols = [c for c in df.columns if c in keep_cols]
-    return df[cols] if cols else df
-
-
-def _fill_bi_cache(
-    token: str,
-    summary_pl: pl.DataFrame,
-    detail_pl: pl.DataFrame,
-    price_history_pl=None,
-    product_cost_history: dict | None = None,
-    product_price_timeline: dict | None = None,
-    bom_pd: "pd.DataFrame | None" = None,
-    price_pd: "pd.DataFrame | None" = None,
-    product_categories: dict | None = None,
-) -> None:
-    """把分析管道已算好的 BI 表直接写入内存缓存，供 BI 接口秒返回。"""
-    # 裁剪到预测所需列，避免完整 BOM 大表长期驻留内存
-    bom_pd   = _slim_df(bom_pd,   _BOM_PREDICT_COLS)
-    price_pd = _slim_df(price_pd, _PRICE_PREDICT_COLS)
-    summary_pd = summary_pl.to_pandas()
-    summary_records = summary_pd.where(pd.notna(summary_pd), None).to_dict(orient="records")
-
-    detail_pd = detail_pl.to_pandas()
-    detail_pd["组件编码"] = detail_pd["组件编码"].astype(str).str.strip()
-    detail_pd[COL_PRODUCT] = detail_pd[COL_PRODUCT].astype(str).str.strip()
-    if "MENGE合计" in detail_pd.columns:
-        detail_pd = detail_pd.sort_values("MENGE合计", ascending=False)
-
-    detail_index: dict[str, list] = {}
-    for comp, grp in detail_pd.groupby("组件编码", sort=False):
-        detail_index[str(comp)] = grp.where(pd.notna(grp), None).to_dict(orient="records")
-
-    product_bom: dict[str, list] = {}
-    for pid, grp in detail_pd.groupby(COL_PRODUCT, sort=False):
-        product_bom[str(pid)] = grp.where(pd.notna(grp), None).to_dict(orient="records")
-
-    # 预计算并缓存排好序的产品 ID 列表（避免每次 bi_products 请求重新排序）
-    all_product_ids: list[str] = sorted(product_bom.keys(), key=lambda s: (len(s), s))
-
-    # 2 字符前缀分桶索引（加速大会话子串搜索：先缩小候选集，再做 `in` 判断）
-    product_prefix_index: dict[str, list[str]] = {}
-    for pid in all_product_ids:
-        prefix = pid[:2] if len(pid) >= 2 else pid
-        if prefix not in product_prefix_index:
-            product_prefix_index[prefix] = []
-        product_prefix_index[prefix].append(pid)
-
-    # 价格历史明细（供日期区间价格波动查询）
-    price_history_records: list = []
-    if price_history_pl is not None:
-        try:
-            ph_pd = price_history_pl.to_pandas()
-            if COL_CREATEDATE in ph_pd.columns:
-                ph_pd[COL_CREATEDATE] = ph_pd[COL_CREATEDATE].map(_calendar_date_key_yyyymmdd)
-            price_history_records = ph_pd.where(pd.notna(ph_pd), None).to_dict(orient="records")
-        except Exception:
-            pass
-    pch = expand_product_cost_history_dict(
-        product_cost_history or {},
-        product_bom,
-        product_price_timeline,
-    )
-
-    entry = {
-        "summary":               summary_records,
-        "detail":                detail_index,
-        "product_bom":           product_bom,
-        "all_product_ids":       all_product_ids,
-        "product_prefix_index":  product_prefix_index,
-        "price_history":         price_history_records,
-        "product_cost_history":  pch,
-        "bom_pd":                bom_pd,
-        "price_pd":              price_pd,
-        "product_categories":    product_categories or {},
-        "ts":                    time.time(),
-    }
-    _bi_cache_put(token, entry)
 
 
 @app.route("/api/process", methods=["POST"])
@@ -890,7 +836,7 @@ def process():
                 combined = _attach_product_prices_pl(combined, price_fp)
             out_path = RESULT_DIR / f"{session_id}.xlsx"
             lines, summary_pl, detail_pl, price_history_pl, pch, bom_pd_pipe = _run_pipeline(combined, out_path)
-            _fill_bi_cache(
+            bi_cache.fill_and_persist(
                 session_id,
                 summary_pl,
                 detail_pl,
@@ -936,7 +882,7 @@ def process():
                 if has_price and price_fp is not None:
                     raw_df_item = _attach_product_prices_pl(raw_df_item, price_fp)
                 lines, summary_pl, detail_pl, price_history_pl, pch, _ = _run_pipeline(raw_df_item, out_path)
-                _fill_bi_cache(
+                bi_cache.fill_and_persist(
                     token,
                     summary_pl,
                     detail_pl,
@@ -976,763 +922,6 @@ def process():
         return jsonify({"error": f"分析失败：{exc}", "detail": detail}), 500
 
 
-# ---------------------------------------------------------------------------
-# BI Analysis – 内存缓存（避免每次请求重复读 Excel）
-# ---------------------------------------------------------------------------
-
-def _load_bi_cache(session_id: str, file_path: Path) -> dict:
-    """
-    读取 Excel 中 BI 用表，构建索引后存入缓存并返回。
-    summary : list[dict]          —— 组件全局成本排名
-    detail  : dict[str, list]     —— 组件编码 → 各产品明细行
-    product_bom: dict[str, list]  —— 产品编码 → 该产品 BOM 明细行（成本模拟用）
-    """
-    # 1. 读取两张工作表
-    summary_df = pd.read_excel(file_path, sheet_name="组件全局成本排名")
-    detail_df  = pd.read_excel(file_path, sheet_name="BOM明细_占比与成本")
-
-    # 2. 预处理 detail：组件编码、产品编码统一为字符串，按 MENGE合计 降序
-    detail_df["组件编码"] = detail_df["组件编码"].astype(str).str.strip()
-    detail_df[COL_PRODUCT] = detail_df[COL_PRODUCT].astype(str).str.strip()
-    if "MENGE合计" in detail_df.columns:
-        detail_df = detail_df.sort_values("MENGE合计", ascending=False)
-
-    # 3. 将 detail 按组件编码建立字典索引，查询时 O(1)
-    detail_index: dict[str, list] = {}
-    for comp, grp in detail_df.groupby("组件编码", sort=False):
-        detail_index[str(comp)] = grp.where(pd.notna(grp), None).to_dict(orient="records")
-
-    product_bom: dict[str, list] = {}
-    for pid, grp in detail_df.groupby(COL_PRODUCT, sort=False):
-        product_bom[str(pid)] = grp.where(pd.notna(grp), None).to_dict(orient="records")
-
-    summary_records = summary_df.where(pd.notna(summary_df), None).to_dict(orient="records")
-
-    # 尝试读取价格历史明细（旧版 Excel 可能不含此表，容错处理）
-    price_history_records: list = []
-    try:
-        ph_df = pd.read_excel(file_path, sheet_name="价格历史明细")
-        if COL_CREATEDATE in ph_df.columns:
-            ph_df[COL_CREATEDATE] = ph_df[COL_CREATEDATE].map(_calendar_date_key_yyyymmdd)
-        price_history_records = ph_df.where(pd.notna(ph_df), None).to_dict(orient="records")
-    except Exception:
-        pass
-
-    entry = {
-        "summary":              summary_records,
-        "detail":               detail_index,
-        "product_bom":          product_bom,
-        "price_history":        price_history_records,
-        "product_cost_history": {},
-        "ts":                   time.time(),
-    }
-
-    _bi_cache_put(session_id, entry)
-    return entry
-
-
-def _get_bi_cache(session_id: str, file_path: Path) -> dict:
-    """命中则更新时间戳后返回；未命中则从磁盘加载。"""
-    with _BI_CACHE_LOCK:
-        if session_id in _BI_CACHE:
-            c = _BI_CACHE[session_id]
-            if "product_bom" not in c:
-                del _BI_CACHE[session_id]
-            else:
-                _BI_CACHE[session_id]["ts"] = time.time()
-                return _BI_CACHE[session_id]
-    # 缓存未命中，在锁外读 Excel（避免长时间持锁）
-    return _load_bi_cache(session_id, file_path)
-
-
-# ---------------------------------------------------------------------------
-# BI Analysis – Page & API
-# ---------------------------------------------------------------------------
-
-@app.route("/bi/<session_id>")
-def bi_view(session_id: str):
-    """BI 分析看板页面。"""
-    if not _UUID_RE.match(session_id):
-        return jsonify({"error": "无效的令牌"}), 400
-    file_path = RESULT_DIR / f"{session_id}.xlsx"
-    if not file_path.exists():
-        return "分析结果不存在或已过期，请返回首页重新上传文件并执行分析。", 404
-    return render_template("bi.html", token=session_id)
-
-
-@app.route("/sim/<session_id>")
-def cost_sim_view(session_id: str):
-    """按产品改组件单价 → 预测原材料总成本（BOM 精确重算）。"""
-    if not _UUID_RE.match(session_id):
-        return jsonify({"error": "无效的令牌"}), 400
-    file_path = RESULT_DIR / f"{session_id}.xlsx"
-    if not file_path.exists():
-        return "分析结果不存在或已过期，请返回首页重新上传文件并执行分析。", 404
-    return render_template("cost_sim.html", token=session_id)
-
-
-def _bi_cache_or_404(session_id: str) -> tuple[dict | None, Path | None, tuple | None]:
-    if not _UUID_RE.match(session_id):
-        return None, None, (jsonify({"error": "无效的令牌"}), 400)
-    file_path = RESULT_DIR / f"{session_id}.xlsx"
-    if not file_path.exists():
-        return None, None, (jsonify({"error": "文件不存在或已过期，请重新分析"}), 404)
-    try:
-        return _get_bi_cache(session_id, file_path), file_path, None
-    except Exception as exc:
-        tb = traceback.format_exc().strip().split("\n")
-        return None, None, (jsonify({"error": f"读取失败：{exc}", "detail": tb[-1]}), 500)
-
-
-def _float_safe(x, default: float = 0.0) -> float:
-    """转 float；空值/非数字/NaN/Inf 返回 default（避免 JSON 出现非法 NaN）。"""
-    try:
-        if x is None or (isinstance(x, str) and not str(x).strip()):
-            return default
-        f = float(x)
-        if math.isnan(f) or math.isinf(f):
-            return default
-        return f
-    except (TypeError, ValueError):
-        return default
-
-
-def _optional_rounded_float(x, *, ndigits: int = 6) -> float | None:
-    """用于 API 的可选数值：缺失或 NaN/Inf 返回 None，否则 round 后返回 Python float。"""
-    if x is None or (isinstance(x, str) and not str(x).strip()):
-        return None
-    try:
-        f = float(x)
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(f) or math.isinf(f):
-        return None
-    return round(f, ndigits)
-
-
-def _json_clean_scalar(v):
-    """标准 JSON 不支持 NaN；将 NaN/Inf、pd.NA 等转为 None。"""
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, str):
-        return v
-    if isinstance(v, int) and not isinstance(v, bool):
-        return v
-    if isinstance(v, float):
-        return None if (math.isnan(v) or math.isinf(v)) else v
-    try:
-        if pd.api.types.is_scalar(v) and pd.isna(v):
-            return None
-    except TypeError:
-        pass
-    try:
-        fv = float(v)
-        if math.isnan(fv) or math.isinf(fv):
-            return None
-        return fv
-    except (TypeError, ValueError):
-        return v
-
-
-def _json_clean_row(row: dict) -> dict:
-    return {k: _json_clean_scalar(v) for k, v in row.items()}
-
-
-@app.route("/api/bi/products/<session_id>")
-def bi_products(session_id: str):
-    """返回本分析会话中的产品编码（供成本模拟页选择）。
-
-    产品数 ≤ ``FULL_LIST_THRESHOLD`` 时一次性返回全部 id，前端本地筛选；
-    超过阈值时不返回完整列表，须带查询参数 ``q`` 做子串匹配（限量），避免超大 JSON 与 DOM。
-    """
-    FULL_LIST_THRESHOLD = 2000
-    try:
-        limit = int(request.args.get("limit", 100))
-    except (TypeError, ValueError):
-        limit = 100
-    limit = max(1, min(limit, 500))
-
-    cache, _, err = _bi_cache_or_404(session_id)
-    if err:
-        return err[0], err[1]
-    assert cache is not None
-
-    # 优先使用缓存中预排序的列表（避免每次请求 O(n log n) 重新排序）
-    all_ids: list[str] = cache.get("all_product_ids") or sorted(
-        (cache.get("product_bom") or {}).keys(), key=lambda s: (len(s), s)
-    )
-    prefix_index: dict[str, list[str]] = cache.get("product_prefix_index") or {}
-    total = len(all_ids)
-    q = (request.args.get("q") or "").strip()
-
-    min_q_len = 3 if total > 200_000 else 2
-
-    def _search_ids(q: str, ids: list[str], idx: dict[str, list[str]], limit: int) -> list[str]:
-        """子串搜索：优先走前缀索引缩小候选集，再做 `in` 判断。"""
-        if not q:
-            return ids[:limit]
-        # 前缀索引：用查询串前 2 位缩小候选（对 SAP 物料号前缀相同的场景效果显著）
-        if len(q) >= 2 and idx:
-            candidates = idx.get(q[:2], [])
-            matched = [p for p in candidates if q in p]
-            # 候选集命中不足一半 limit 时，补全扫完整列表（兜底任意位置子串）
-            if len(matched) < limit:
-                seen = set(candidates)
-                for p in ids:
-                    if p not in seen and q in p:
-                        matched.append(p)
-                    if len(matched) >= limit:
-                        break
-        else:
-            matched = [p for p in ids if q in p]
-        return matched[:limit]
-
-    if total <= FULL_LIST_THRESHOLD:
-        items = _search_ids(q, all_ids, prefix_index, limit) if q else all_ids
-        return jsonify(
-            {
-                "count":           total,
-                "total":           total,
-                "search_required": False,
-                "min_q_len":       min_q_len,
-                "products":        [{"id": p, "label": p} for p in (items if q else all_ids)],
-            }
-        )
-
-    # 大会话：禁止一次性下发全部产品编码
-    if not q:
-        return jsonify(
-            {
-                "count":           total,
-                "total":           total,
-                "search_required": True,
-                "min_q_len":       min_q_len,
-                "products":        [],
-                "hint":            f"共 {total} 个产品，请在输入框中输入至少 {min_q_len} 位编码片段进行搜索",
-            }
-        )
-
-    if len(q) < min_q_len:
-        return jsonify(
-            {
-                "count":           total,
-                "total":           total,
-                "search_required": True,
-                "min_q_len":       min_q_len,
-                "products":        [],
-                "hint":            f"请至少输入 {min_q_len} 位再搜索（当前 {len(q)} 位）",
-            }
-        )
-
-    matched = _search_ids(q, all_ids, prefix_index, limit)
-
-    return jsonify(
-        {
-            "count":           total,
-            "total":           total,
-            "search_required": True,
-            "min_q_len":       min_q_len,
-            "q":               q,
-            "match_count":     len(matched),
-            "truncated":       len(matched) >= limit,
-            "products":        [{"id": x, "label": x} for x in matched],
-        }
-    )
-
-
-def _map_new_predict_result(
-    pred: dict,
-    price_snap: dict,
-    *,
-    is_bom_load: bool = False,
-) -> dict:
-    """将新 predict_product_price 的英文键结果映射为前端兼容的中文键格式。"""
-    if "error" in pred:
-        bl = baseline_prices_from_price_snap(price_snap, None)
-        return {
-            "预测产品价格": None,
-            "预测产品价格_每公斤": None,
-            "基准产品价格": bl.get("基准产品价格") or price_snap.get("总成本"),
-            "基准产品价格_每公斤": bl.get("基准产品价格_每公斤") or price_snap.get("总成本"),
-            "预测方法": "—",
-            "预测可信度": 0,
-            "可信度等级": "低",
-            "可信度说明": pred["error"],
-            "敏感性分析": [],
-            "敏感性网格": {"可用": False},
-            "模型历史误差": {"可用": False, "说明": pred["error"]},
-            "预测警告": [pred["error"]],
-            "预测详情": None,
-            "产品重量_kg": None,
-            "价格口径": "元/KG",
-        }
-
-    conf = int(pred.get("confidence_score") or 0)
-    if conf >= 90:
-        level = "高"
-    elif conf >= 65:
-        level = "中等"
-    elif conf >= 40:
-        level = "较低，建议参考"
-    else:
-        level = "低，仅供参考"
-
-    point_est = pred.get("point_estimate")   # 元/件
-    point_kg = pred.get("point_per_kg")      # 元/kg
-    weight = pred.get("detail", {}).get("base_weight")
-    try:
-        weight_f = float(weight) if weight is not None else None
-    except (TypeError, ValueError):
-        weight_f = None
-
-    bl = baseline_prices_from_price_snap(price_snap, weight_f)
-    base_product = bl.get("基准产品价格")
-    base_total = bl.get("基准产品价格_每公斤")
-
-    user_adjusted = False if is_bom_load else bool(pred.get("user_adjusted_prices"))
-    if is_bom_load:
-        point_est = base_product
-        point_kg = base_total
-    diff_pred = None
-    diff_pred_kg = None
-    if user_adjusted:
-        if point_est is not None and base_product is not None:
-            try:
-                diff_pred = round(float(point_est) - float(base_product), 6)
-            except (TypeError, ValueError):
-                pass
-        if point_kg is not None and base_total is not None:
-            try:
-                diff_pred_kg = round(float(point_kg) - float(base_total), 6)
-            except (TypeError, ValueError):
-                pass
-
-    warnings_list = list(dict.fromkeys(pred.get("warnings") or []))
-    cred_parts: list[str] = []
-    method = pred.get("method") or ""
-    if method == "cost_structure_ratio":
-        cred_parts.append("成本结构公式：材料成本随 BOM 比例传导，工费不变")
-    elif method.startswith("conduction_coeff"):
-        cred_parts.append("传导系数模型：由历史 BOM 与材料成本变动估计")
-    detail = pred.get("detail") or {}
-    n_months = detail.get("n_price_months")
-    if n_months:
-        cred_parts.append(f"价格历史 {n_months} 个月")
-    if warnings_list:
-        cred_parts.append(f"风险提示 {len(warnings_list)} 条（见上方列表）")
-    return {
-        "预测产品价格": point_est,
-        "预测产品价格_每公斤": point_kg,
-        "基准产品价格": base_product,
-        "基准产品价格_每公斤": base_total,
-        "清单材料工费口径": bl.get("清单材料工费口径"),
-        "预测方法": pred.get("method"),
-        "预测可信度": conf,
-        "可信度等级": level,
-        "可信度说明": "；".join(cred_parts) if cred_parts else "无明显风险",
-        "用户已调价": user_adjusted,
-        "差额_预测产品价": diff_pred,
-        "差额_预测产品价_每公斤": diff_pred_kg,
-        "基准参照说明": (
-            f"价格清单基准：整件 {base_product} 元/件，{base_total} 元/kg"
-            if base_product is not None and base_total is not None
-            else None
-        ),
-        "敏感性分析": [
-            map_sensitivity_item_en_to_zh(x) for x in (pred.get("sensitivity") or [])
-        ],
-        "敏感性网格": map_sensitivity_grid_en_to_zh(pred.get("sensitivity_grid") or {}),
-        "回归分析": map_regression_analysis_en_to_zh(pred.get("regression_analysis") or {})
-        if pred.get("regression_analysis")
-        else None,
-        "模型历史误差": pred.get("model_error") or {"可用": False},
-        "预测警告": warnings_list,
-        "预测详情": pred.get("detail"),
-        "产品重量_kg": weight,
-        "价格口径": "元/KG",
-    }
-
-
-@app.route("/api/bi/product_bom/<session_id>")
-def bi_product_bom(session_id: str):
-    """某产品的 BOM 明细行 + 当前原材料总成本；含「单价每涨 1」对总成本的边际（= MENGE合计）。"""
-    product = (request.args.get("product") or "").strip()
-    if not product:
-        return jsonify({"error": "缺少参数 product（产品编码）"}), 400
-    cache, _, err = _bi_cache_or_404(session_id)
-    if err:
-        return err[0], err[1]
-    assert cache is not None
-    rows = (cache.get("product_bom") or {}).get(product)
-    if not rows:
-        return jsonify({"error": f"未找到产品：{product}"}), 404
-
-    lines: list[dict] = []
-    baseline = 0.0
-    for r in rows:
-        row = dict(r)
-        m = _float_safe(row.get("MENGE合计"))
-        p0 = _float_safe(row.get("组件单价"))
-        line_cost = _float_safe(row.get("行原材料成本"), m * p0)
-        baseline += line_cost
-        row["行原材料成本"] = line_cost
-        row["单价每变动1对总成本的边际"] = m
-        lines.append(row)
-    # 重新计算成本占比（需最终 baseline）
-    if baseline > 0:
-        for row in lines:
-            lc = _float_safe(row.get("行原材料成本"))
-            row["成本占产品%"] = round(100.0 * lc / baseline, 4)
-    lines.sort(key=lambda x: _float_safe(x.get("行原材料成本")), reverse=True)
-
-    price_snap = _product_price_snapshot_from_bom_rows(rows)
-    product_price = price_snap.get("总成本")
-    prices_old = {
-        str(r.get("组件编码") or "").strip(): _float_safe(r.get("组件单价"))
-        for r in rows
-    }
-
-    # 优先使用新预测算法（需要 bom_pd 和 price_pd）
-    bom_pd = cache.get("bom_pd")
-    price_pd = cache.get("price_pd")
-    if bom_pd is not None and price_pd is not None:
-        bom_snap = latest_bom_snapshot_from_rows(product, rows)
-        pred = predict_product_price(
-            product,
-            {},
-            bom_pd,
-            price_pd,
-            reference_prices=prices_old,
-            latest_bom_snapshot=bom_snap,
-        )
-        pred = _map_new_predict_result(pred, price_snap, is_bom_load=True)
-    else:
-        pred = map_legacy_predict_en_to_zh(
-            _predict_product_price_legacy(
-                product=product,
-                simulated_material=baseline,
-                baseline_material=baseline,
-                price_snap=price_snap,
-                product_cost_history=cache.get("product_cost_history"),
-                price_history=cache.get("price_history"),
-                bom_rows=rows,
-                prices_new=prices_old,
-                prices_old=prices_old,
-                product_categories=cache.get("product_categories"),
-            )
-        )
-
-    lines_out = [_json_clean_row(row) for row in lines]
-
-    return jsonify(
-        {
-            "product": product,
-            "baseline原材料总成本": round(baseline, 6),
-            "产品价格": product_price,
-            "总成本": product_price,
-            **{k: v for k, v in price_snap.items() if k != "总成本"},
-            **pred,
-            "说明": (
-                "主结果「预测产品价格」由历史报价关系与成本结构（材料成本+工费）推算，不是简单 BOM 行相加。"
-                "「模拟原材料总成本」为各组件数量×模拟单价之和，供对照。"
-            ),
-            "lines": lines_out,
-        }
-    )
-
-
-def _simulate_product_cost(
-    cache: dict,
-    product: str,
-    prices_in: dict,
-) -> dict:
-    """组件单价 → BOM 材料合计 + 预测产品总价 + 可信度。"""
-    rows = (cache.get("product_bom") or {}).get(product)
-    if not rows:
-        raise ValueError(f"未找到产品：{product}")
-
-    prices = {str(k).strip(): _float_safe(v) for k, v in prices_in.items()}
-    prices_old: dict[str, float] = {}
-
-    baseline = 0.0
-    simulated = 0.0
-    line_out: list[dict] = []
-    for r in rows:
-        comp = str(r.get("组件编码") or "").strip()
-        m = _float_safe(r.get("MENGE合计"))
-        old_p = _float_safe(r.get("组件单价"))
-        prices_old[comp] = old_p
-        old_line = _float_safe(r.get("行原材料成本"), m * old_p)
-        baseline += old_line
-        new_p = prices[comp] if comp in prices else old_p
-        new_line = m * new_p
-        simulated += new_line
-        line_out.append(
-            {
-                "组件编码": comp,
-                "组件名称": r.get("组件名称"),
-                "MENGE合计": m,
-                "原单价": old_p,
-                "模拟单价": new_p,
-                "原行成本": round(old_line, 6),
-                "模拟行成本": round(new_line, 6),
-            }
-        )
-
-    sim_round = round(simulated, 6)
-    for row in line_out:
-        nl = _float_safe(row.get("模拟行成本"))
-        row["成本占产品%"] = (
-            round(100.0 * nl / simulated, 4) if simulated > 1e-12 else 0.0
-        )
-
-    price_snap = _product_price_snapshot_from_bom_rows(rows)
-
-    # 优先使用新预测算法
-    bom_pd = cache.get("bom_pd")
-    price_pd = cache.get("price_pd")
-    if bom_pd is not None and price_pd is not None:
-        all_prices = {c: prices.get(c, prices_old[c]) for c in prices_old}
-        user_changes = {
-            c: all_prices[c]
-            for c in prices_old
-            if abs(all_prices[c] - prices_old[c]) > 1e-9
-        }
-        bom_snap = latest_bom_snapshot_from_rows(product, rows)
-        pred = predict_product_price(
-            product,
-            user_changes,
-            bom_pd,
-            price_pd,
-            reference_prices=prices_old,
-            latest_bom_snapshot=bom_snap,
-        )
-        pred = _map_new_predict_result(pred, price_snap)
-    else:
-        pred = map_legacy_predict_en_to_zh(
-            _predict_product_price_legacy(
-                product=product,
-                simulated_material=simulated,
-                baseline_material=baseline,
-                price_snap=price_snap,
-                product_cost_history=cache.get("product_cost_history"),
-                price_history=cache.get("price_history"),
-                bom_rows=rows,
-                prices_new={c: prices.get(c, prices_old[c]) for c in prices_old},
-                prices_old=prices_old,
-                product_categories=cache.get("product_categories"),
-            )
-        )
-
-    ref_total = price_snap.get("总成本")
-
-    payload: dict = {
-        "product": product,
-        "baseline原材料总成本": round(baseline, 6),
-        "模拟原材料总成本": sim_round,
-        "差额": round(simulated - baseline, 6),
-        "总成本": ref_total,
-        **{k: v for k, v in price_snap.items() if k != "总成本"},
-        "差额_相对总成本": (
-            round(sim_round - ref_total, 6) if ref_total is not None else None
-        ),
-        "lines": [_json_clean_row(x) for x in line_out],
-        **pred,
-    }
-    return payload
-
-
-@app.route("/api/bi/product_cost_simulate/<session_id>", methods=["POST"])
-def bi_product_cost_simulate(session_id: str):
-    """根据组件单价预测产品总价（含可信度），并返回 BOM 材料合计明细。"""
-    cache, _, err = _bi_cache_or_404(session_id)
-    if err:
-        return err[0], err[1]
-    assert cache is not None
-    data = request.get_json(silent=True) or {}
-    product = str(data.get("product") or "").strip()
-    prices_in = data.get("prices") or {}
-    if not product:
-        return jsonify({"error": "缺少 product"}), 400
-    try:
-        payload = _simulate_product_cost(cache, product, prices_in)
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 404
-    return jsonify(payload)
-
-
-@app.route("/api/bi/summary/<session_id>")
-def bi_summary(session_id: str):
-    """返回「组件全局成本排名」数据，并同步将「BOM明细」预加载进缓存。
-    第一次调用会读整个 Excel（稍慢），之后所有 detail 请求均走内存。"""
-    if not _UUID_RE.match(session_id):
-        return jsonify({"error": "无效的令牌"}), 400
-    file_path = RESULT_DIR / f"{session_id}.xlsx"
-    if not file_path.exists():
-        return jsonify({"error": "文件不存在或已过期，请重新分析"}), 404
-    try:
-        cache = _get_bi_cache(session_id, file_path)
-        return jsonify({"data": cache["summary"]})
-    except Exception as exc:
-        tb = traceback.format_exc().strip().split("\n")
-        return jsonify({"error": f"读取失败：{exc}", "detail": tb[-1]}), 500
-
-
-@app.route("/api/bi/detail/<session_id>")
-def bi_detail(session_id: str):
-    """返回某组件在各产品中的用量明细，走内存缓存、O(1) 查找，无磁盘 IO。"""
-    if not _UUID_RE.match(session_id):
-        return jsonify({"error": "无效的令牌"}), 400
-    component = request.args.get("component", "").strip()
-    if not component:
-        return jsonify({"error": "缺少参数 component"}), 400
-    file_path = RESULT_DIR / f"{session_id}.xlsx"
-    if not file_path.exists():
-        return jsonify({"error": "文件不存在或已过期，请重新分析"}), 404
-    try:
-        cache   = _get_bi_cache(session_id, file_path)
-        records = cache["detail"].get(component, [])
-        return jsonify({
-            "data":      records,
-            "component": component,
-            "count":     len(records),
-        })
-    except Exception as exc:
-        tb = traceback.format_exc().strip().split("\n")
-        return jsonify({"error": f"读取失败：{exc}", "detail": tb[-1]}), 500
-
-
-# ---------------------------------------------------------------------------
-# BI Analysis – Price Fluctuation
-# ---------------------------------------------------------------------------
-
-@app.route("/api/bi/price_fluctuation/<session_id>")
-def bi_price_fluctuation(session_id: str):
-    """按日期区间查询组件价格波动，按价格差值绝对值降序返回，并给出分类影响汇总。
-    参数：start_date(YYYYMMDD)、end_date(YYYYMMDD)、min_change_pct(可选)
-    """
-    if not _UUID_RE.match(session_id):
-        return jsonify({"error": "无效的令牌"}), 400
-
-    start_date = (request.args.get("start_date") or "").strip().replace("-", "")
-    end_date   = (request.args.get("end_date")   or "").strip().replace("-", "")
-    min_pct    = abs(float(request.args.get("min_change_pct", 0) or 0))
-
-    if not start_date or not end_date:
-        return jsonify({"error": "请提供 start_date 和 end_date（格式：YYYYMMDD 或 YYYY-MM-DD）"}), 400
-
-    file_path = RESULT_DIR / f"{session_id}.xlsx"
-    if not file_path.exists():
-        return jsonify({"error": "文件不存在或已过期，请重新分析"}), 404
-
-    try:
-        cache         = _get_bi_cache(session_id, file_path)
-        price_history = cache.get("price_history", [])
-
-        if not price_history:
-            return jsonify({
-                "error": "无价格历史数据（可能是旧版分析结果），请重新上传并执行分析",
-                "data":  [], "category_impact": [], "has_category": False,
-            }), 200
-
-        df = pd.DataFrame(price_history)
-
-        # 统一 CREATEDATE / 生价日期 为 8 位 YYYYMMDD（与 bom_date_key 一致）
-        if COL_CREATEDATE in df.columns:
-            df[COL_CREATEDATE] = df[COL_CREATEDATE].map(_calendar_date_key_yyyymmdd)
-            df_range = df[(df[COL_CREATEDATE] >= start_date) & (df[COL_CREATEDATE] <= end_date)].copy()
-        else:
-            df_range = df.copy()   # 无日期列则不过滤，返回全部
-
-        if df_range.empty:
-            return jsonify({
-                "data": [], "category_impact": [], "has_category": False,
-                "message": f"所选日期范围（{start_date}–{end_date}）内无数据",
-                "total": 0,
-            })
-
-        comp_col   = "组件编码"
-        price_col  = "组件单价"
-        has_cat    = bool(COL_CATEGORY in df_range.columns and df_range[COL_CATEGORY].notna().any())
-        has_name   = bool("MAKTX" in df_range.columns or "组件名称" in df_range.columns)
-        name_col   = "组件名称" if "组件名称" in df_range.columns else ("MAKTX" if "MAKTX" in df_range.columns else None)
-
-        results = []
-        for comp, grp in df_range.groupby(comp_col, sort=False):
-            if COL_CREATEDATE in grp.columns:
-                grp = grp.sort_values(COL_CREATEDATE)
-            price_vals  = grp[price_col].dropna().astype(float)
-            if price_vals.empty:
-                continue
-            price_start = float(price_vals.iloc[0])
-            price_end   = float(price_vals.iloc[-1])
-            price_min   = float(price_vals.min())
-            price_max   = float(price_vals.max())
-            price_diff  = price_end - price_start
-            price_pct   = round((price_diff / price_start * 100), 2) if price_start != 0 else 0.0
-
-            row = {
-                "组件编码":   str(comp),
-                "期初价格":   round(price_start, 4),
-                "期末价格":   round(price_end, 4),
-                "期间最低价": round(price_min, 4),
-                "期间最高价": round(price_max, 4),
-                "价格差值":   round(price_diff, 4),
-                "价格变动%":  price_pct,
-                "记录数":     int(len(grp)),
-                "涉及产品数": int(grp["产品编码"].nunique()) if "产品编码" in grp.columns else 0,
-            }
-            if name_col:
-                row["组件名称"] = str(grp[name_col].dropna().iloc[0]) if grp[name_col].notna().any() else ""
-            if has_cat:
-                row[COL_CATEGORY] = str(grp[COL_CATEGORY].dropna().iloc[0]) if grp[COL_CATEGORY].notna().any() else ""
-            results.append(row)
-
-        # 按变动百分比绝对值过滤
-        if min_pct > 0:
-            results = [r for r in results if abs(r["价格变动%"]) >= min_pct]
-
-        # 默认按价格差值降序排列（最大涨幅在前）
-        results.sort(key=lambda r: r["价格差值"], reverse=True)
-
-        # 分类影响汇总
-        category_impact = []
-        if has_cat and results:
-            cat_df = pd.DataFrame(results)
-            cat_df = cat_df[cat_df[COL_CATEGORY].notna() & (cat_df[COL_CATEGORY] != "")]
-            if not cat_df.empty:
-                for cat, cgrp in cat_df.groupby(COL_CATEGORY, sort=False):
-                    pcts = cgrp["价格变动%"]
-                    abs_max = float(pcts.abs().max())
-                    level   = "高" if abs_max >= 10 else ("中" if abs_max >= 3 else "低")
-                    category_impact.append({
-                        "分类":        str(cat),
-                        "平均变动%":   round(float(pcts.mean()), 2),
-                        "最大涨幅%":   round(float(pcts.max()),  2),
-                        "最大跌幅%":   round(float(pcts.min()),  2),
-                        "最大绝对变动%": round(abs_max, 2),
-                        "涉及组件数":  int(len(cgrp)),
-                        "上涨组件数":  int((pcts > 0).sum()),
-                        "下跌组件数":  int((pcts < 0).sum()),
-                        "影响等级":    level,
-                    })
-                category_impact.sort(key=lambda r: r["最大绝对变动%"], reverse=True)
-
-        return jsonify({
-            "data":           results,
-            "category_impact": category_impact,
-            "date_range":     {"start": start_date, "end": end_date},
-            "total":          len(results),
-            "has_category":   has_cat,
-            "has_name":       bool(name_col),
-        })
-
-    except Exception as exc:
-        tb = traceback.format_exc().strip().split("\n")
-        return jsonify({"error": f"价格波动分析失败：{exc}", "detail": tb[-1]}), 500
-
 
 def _parse_excel_dates(series: pd.Series) -> pd.Series:
     """把 Excel/SAP 常见日期格式统一成 pandas datetime。"""
@@ -1752,15 +941,63 @@ def _first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | Non
     return None
 
 
+class AiPurchaseAdviceUnavailable(Exception):
+    """未配置 DeepSeek 等前置条件，AI 采购建议不可用。"""
+
+
+def _deepseek_api_key() -> str:
+    return os.environ.get("DEEPSEEK_API_KEY", "").strip()
+
+
+def _baidu_search_api_key() -> str:
+    return os.environ.get("BAIDU_SEARCH_API_KEY", "").strip()
+
+
+def _external_capabilities() -> dict:
+    """外网 / API Key 能力（与会话无关）。"""
+    deepseek = bool(_deepseek_api_key())
+    baidu = bool(_baidu_search_api_key())
+    ai_reason = ""
+    if not deepseek:
+        ai_reason = (
+            "未配置 DEEPSEEK_API_KEY。请在 web 目录下创建 .env 并设置该变量后重启服务。"
+        )
+    baidu_note = ""
+    if deepseek and not baidu:
+        baidu_note = (
+            "未配置 BAIDU_SEARCH_API_KEY，联网行情搜索不可用；"
+            "仍将基于本地 Excel 价格波动与模型常识生成建议（证据可能较弱）。"
+        )
+    return {
+        "ai_purchase_advice": {
+            "enabled": deepseek,
+            "reason": ai_reason,
+            "baidu_search": baidu,
+            "baidu_note": baidu_note,
+        },
+    }
+
+
+init_bi_blueprint(_external_capabilities)
+app.register_blueprint(bi_bp)
+
+
+def _require_deepseek_for_ai() -> None:
+    if not _deepseek_api_key():
+        raise AiPurchaseAdviceUnavailable(
+            "未配置 DEEPSEEK_API_KEY。请在 web/.env 中设置后重启服务。"
+        )
+
+
 def _deepseek_model() -> str:
     return os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro").strip() or "deepseek-v4-pro"
 
 
 def _deepseek_headers() -> dict:
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    api_key = _deepseek_api_key()
     if not api_key:
-        raise RuntimeError(
-            "未配置 DEEPSEEK_API_KEY。请先在 web/.env 中设置 DEEPSEEK_API_KEY。"
+        raise AiPurchaseAdviceUnavailable(
+            "未配置 DEEPSEEK_API_KEY。请在 web/.env 中设置后重启服务。"
         )
     return {
         "Content-Type": "application/json",
@@ -1971,7 +1208,7 @@ def _call_deepseek_for_purchase_advice(materials: list[dict], start_date: str, e
 
 
 def _build_purchase_advice_materials(session_id: str, file_path: Path) -> dict:
-    cache = _get_bi_cache(session_id, file_path)
+    cache = bi_cache.get(session_id, file_path)
     price_history = cache.get("price_history", [])
     if not price_history:
         raise ValueError("无物料明细数据，请重新上传并执行分析")
@@ -2106,10 +1343,19 @@ def bi_ai_purchase_advice(session_id: str):
     if not _UUID_RE.match(session_id):
         return jsonify({"error": "无效的令牌"}), 400
 
-    file_path = RESULT_DIR / f"{session_id}.xlsx"
-    if not file_path.exists():
-        return jsonify({"error": "文件不存在或已过期，请重新分析"}), 404
+    try:
+        _require_deepseek_for_ai()
+    except AiPurchaseAdviceUnavailable as exc:
+        return jsonify({
+            "error": str(exc),
+            "code": "AI_DISABLED",
+            "enabled": False,
+        }), 503
 
+    if not bi_cache.session_ready(session_id):
+        return jsonify({"error": "会话不存在或已过期，请重新分析"}), 404
+
+    file_path = RESULT_DIR / f"{session_id}.xlsx"
     try:
         info = _build_purchase_advice_materials(session_id, file_path)
         materials_for_ai = info["materials"]
@@ -2124,6 +1370,8 @@ def bi_ai_purchase_advice(session_id: str):
             "total": info["total"],
         })
 
+    except AiPurchaseAdviceUnavailable as exc:
+        return jsonify({"error": str(exc), "code": "AI_DISABLED", "enabled": False}), 503
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 422
     except Exception as exc:
@@ -2137,13 +1385,18 @@ def bi_ai_purchase_advice_stream(session_id: str):
     if not _UUID_RE.match(session_id):
         return jsonify({"error": "无效的令牌"}), 400
 
+    try:
+        _require_deepseek_for_ai()
+    except AiPurchaseAdviceUnavailable as exc:
+        return jsonify({
+            "error": str(exc),
+            "code": "AI_DISABLED",
+            "enabled": False,
+        }), 503
+
     file_path = RESULT_DIR / f"{session_id}.xlsx"
-    # 优先检查内存缓存（分析完成即可用，无需等待背景 Excel 写盘）；
-    # 缓存不存在时才退化到要求文件落盘。
-    with _BI_CACHE_LOCK:
-        in_cache = session_id in _BI_CACHE
-    if not in_cache and not file_path.exists():
-        return jsonify({"error": "分析结果不存在或已过期，请重新分析"}), 404
+    if not bi_cache.session_ready(session_id):
+        return jsonify({"error": "会话不存在或已过期，请重新分析"}), 404
 
     def sse(event: str, data) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -2160,6 +1413,12 @@ def bi_ai_purchase_advice_stream(session_id: str):
             ):
                 yield sse("delta", {"text": delta})
             yield sse("done", {"ok": True})
+        except AiPurchaseAdviceUnavailable as exc:
+            yield sse("error", {
+                "error": str(exc),
+                "code": "AI_DISABLED",
+                "enabled": False,
+            })
         except Exception as exc:
             yield sse("error", {"error": f"AI 采购建议生成失败：{exc}"})
 
@@ -2177,6 +1436,11 @@ def download(session_id: str):
     """
     if not _UUID_RE.match(session_id):
         return jsonify({"error": "无效的下载令牌"}), 400
+
+    if not bi_cache.write_excel_enabled():
+        return jsonify({
+            "error": "Excel 导出已关闭（BOM_WRITE_EXCEL=0）。请使用 BI 看板查看分析结果。",
+        }), 503
 
     file_path = RESULT_DIR / f"{session_id}.xlsx"
 
@@ -2240,9 +1504,19 @@ def _should_auto_open_browser(*, debug: bool, use_reloader: bool) -> bool:
     return True
 
 
+def _should_run_startup_tasks(*, debug: bool, use_reloader: bool) -> bool:
+    if debug and use_reloader:
+        return os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+    return True
+
+
 if __name__ == "__main__":
     _DEBUG = os.environ.get("FLASK_DEBUG", "").strip().lower() in ("1", "true")
     _USE_RELOADER = _DEBUG
+
+    if _should_run_startup_tasks(debug=_DEBUG, use_reloader=_USE_RELOADER):
+        _purge_upload_and_results()
+        _schedule_daily_purge()
 
     print()
     print("=" * 52)

@@ -33,7 +33,12 @@
       <br><span class="text-slate-700">・<strong>模型可信度</strong></span>：反映本次调价在历史数据中的支撑程度。
       <br>材料单价、价格清单中的成本均为<strong>元/公斤</strong>；产品总价 = 每公斤价 × <strong>重量(kg)</strong>。
       建议同时上传：<strong>报价BOM历史清单</strong>和<strong>产品价格历史清单</strong>。
+      <span class="text-slate-400">（本页 BOM 模拟在本地计算，无需外网 API Key。）</span>
     </p>
+
+    <div id="cost-sim-predict-hint" class="hidden mb-4 text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 leading-relaxed">
+      <span class="font-semibold">高级预测受限：</span><span id="cost-sim-predict-hint-text">—</span>
+    </div>
 
     <div class="flex flex-wrap gap-4 items-end mb-6">
       <div class="min-w-[260px] flex-1 relative">
@@ -158,7 +163,22 @@
 
   <script>
     const TOKEN = "{{ token }}";
+    const CAPABILITIES = {{ capabilities | tojson }};
     const API = (path) => path.replace("{t}", TOKEN);
+
+    function applyCostSimCapabilities() {
+      const cs = (CAPABILITIES && CAPABILITIES.cost_sim) || {};
+      const hint = document.getElementById("cost-sim-predict-hint");
+      const hintText = document.getElementById("cost-sim-predict-hint-text");
+      if (cs.predict_enabled === false && cs.reason) {
+        if (hint && hintText) {
+          hintText.textContent = cs.reason;
+          hint.classList.remove("hidden");
+        }
+        return;
+      }
+      if (hint) hint.classList.add("hidden");
+    }
 
     let currentProduct = "";
     let baselineTotal = 0;
@@ -762,6 +782,7 @@
     document.getElementById("btn-sim").addEventListener("click", () => simulate().catch((e) => showErr(e.message)));
     document.getElementById("btn-reset").addEventListener("click", resetPrices);
 
+    applyCostSimCapabilities();
     loadProductsMeta().catch((e) => showErr(e.message));
   </script>
 </body>

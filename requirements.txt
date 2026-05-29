@@ -1,5 +1,2 @@
-pandas>=2.0.0
-openpyxl>=3.1.0
-polars>=1.0.0
-pyarrow>=14.0.0
-flask>=3.0.0
+# Web 版依赖（项目仅保留网页分析）
+-r web/requirements.txt
